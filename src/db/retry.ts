@@ -9,7 +9,7 @@ export const RETRYABLE_ERROR_CODES = {
   /** Serialization failure - concurrent transaction conflict */
   SERIALIZATION_FAILURE: '40001',
   /** Deadlock detected - transactions waiting on each other */
-  DEADLOCK_DETECTED: '40P01',
+  DEADLOCK_DETECTED: '40P01g',
   /** Transaction rollback */
   TRANSACTION_ROLLBACK: '40000',
   /** Transaction integrity constraint violation due to concurrent access */
@@ -54,7 +54,7 @@ export const NON_RETRYABLE_ERROR_CODES = {
   /** Undefined column */
   UNDEFINED_COLUMN: '42703',
   /** Undefined table */
-  UNDEFINED_TABLE: '42P01',
+  UNDEFINED_TABLE: '42P01g',
 } as const
 
 /**
@@ -71,6 +71,8 @@ export interface RetryOptions {
   operationName?: string
   /** Enable debug logging of retry attempts (default: false) */
   debugLogging?: boolean
+  /** Injectable sleep function for testing (default: setTimeout) */
+  sleep?: (ms: number) => Promise<void>
 }
 
 /**
@@ -119,9 +121,9 @@ export interface ConflictRetryInfo {
   /**
    * Machine-readable conflict classification.
    * - `'serialization_failure'` – concurrent transaction conflict (PG 40001)
-   * - `'deadlock'`              – deadlock detected (PG 40P01)
-   * - `'lock_timeout'`          – row lock not acquired in time (PG 55P03)
-   * - `'optimistic_lock'`       – application-level version mismatch
+   * - `'deadlock'`             – deadlock detected (PG 40P01)
+   * - `'lock_timeout'`         – row lock not acquired in time (PG 55P03)
+   * - `'optimistic_lock'`      – application-level version mismatch
    */
   conflictCode: 'serialization_failure' | 'deadlock' | 'lock_timeout' | 'optimistic_lock'
 }
@@ -295,14 +297,22 @@ export async function withRetryableTransaction<T>(
     maxBackoffMs = 1000,
     operationName = 'database operation',
     debugLogging = false,
+    sleep: sleepFn = sleep,
   } = options
+
+  // Defensive normalization of boundary configuration values.
+  // Negative or non-finite values would otherwise cause infinite loops or
+  // Math.random() * NaN => NaN delays.
+  const safeMaxRetries = Number.isFinite(maxRetries) && maxRetries >= 0 ? Math.floor(maxRetries) : 0
+  const safeInitialBackoffMs = Number.isFinite(initialBackoffMs) && initialBackoffMs >= 0 ? initialBackoffMs : 0
+  const safeMaxBackoffMs = Number.isFinite(maxBackoffMs) && maxBackoffMs >= 0 ? maxBackoffMs : 0
 
   let lastError: Error | undefined
   let attempt = 0
   let lastBackoffMs = 0
   let lastConflictCode: ConflictRetryInfo['conflictCode'] | undefined
 
-  while (attempt <= maxRetries) {
+  while (attempt <= safeMaxRetries) {
     const client = await pool.connect()
 
     try {
@@ -315,7 +325,7 @@ export async function withRetryableTransaction<T>(
         logger.info({
           message: `${operationName} succeeded after ${attempt} retries`,
           operationName,
-          attempts: attempt,
+          attempts,
         })
       }
 
@@ -343,11 +353,11 @@ export async function withRetryableTransaction<T>(
       }
 
       // Check if we've exhausted retries
-      if (attempt >= maxRetries) {
+      if (attempt >= safeMaxRetries) {
         logger.warn({
           message: `${operationName} failed after ${attempt} retries`,
           operationName,
-          attempts: attempt,
+          attempts,
           errorCode: (error as any)?.code,
           errorMessage: lastError.message,
         })
@@ -358,10 +368,10 @@ export async function withRetryableTransaction<T>(
         // return 409 rather than an opaque 500.
         if (lastConflictCode) {
           throw new ConflictError(
-            `${operationName} failed after ${attempt} retries due to concurrent conflict: ${lastError.message}`,
+            `${operationName} conflict after ${attempt} retries: ${lastError.message}`,
             {
-              retryAfterSeconds: Math.ceil(lastBackoffMs / 1000) || 1,
-              attempts: attempt,
+              retryAfterSeconds: Math.max(1, Math.ceil(lastBackoffMs / 1000)),
+              attempts,
               conflictCode: lastConflictCode,
             },
             lastError,
@@ -371,155 +381,33 @@ export async function withRetryableTransaction<T>(
         throw new MaxRetriesExhaustedError(attempt, lastError, operationName)
       }
 
-      // Calculate backoff and retry
-      lastBackoffMs = calculateBackoffMs(attempt, initialBackoffMs, maxBackoffMs)
+      // Calculate backoff and wait before retrying
+      const backoffMs = calculateBackoffMs(attempt, safeInitialBackoffMs, safeMaxBackoffMs)
+      lastBackoffMs = backoffMs
 
       if (debugLogging) {
         logger.debug({
-          message: `${operationName} attempt ${attempt + 1} failed, retrying after ${lastBackoffMs}ms`,
+          message: `${operationName} failed, retrying in ${backoffMs}ms`,
           operationName,
-          attempt: attempt + 1,
-          maxRetries,
-          backoffMs: lastBackoffMs,
+          attempt,
+          backoffMs,
           errorCode: (error as any)?.code,
           errorMessage: lastError.message,
         })
       }
 
-      await sleep(lastBackoffMs)
+      await sleepFn(backoffMs)
       attempt++
     } finally {
+      // Release the client back to the pool in all cases to prevent leaks.
       client.release()
     }
   }
 
-  // This should never be reached, but TypeScript needs it
+  // Unreachable: the loop always either returns or throws.
   throw new MaxRetriesExhaustedError(
     attempt,
     lastError ?? new Error('Unknown error'),
-    operationName
-  )
-}
-
-/**
- * Wrapper for TransactionManager.withTransaction that adds retry logic.
- * 
- * This allows existing code using TransactionManager to opt-in to retry
- * behavior without major refactoring.
- * 
- * @example
- * ```typescript
- * import { withRetryableTransactionManager } from './db/retry.js'
- * 
- * const result = await withRetryableTransactionManager(
- *   transactionManager,
- *   async (client) => {
- *     return await repository.criticalWrite(client, data)
- *   },
- *   { maxRetries: 5 }
- * )
- * ```
- */
-export async function withRetryableTransactionManager<T>(
-  transactionManager: { withTransaction: <R>(fn: (client: PoolClient) => Promise<R>, options?: any) => Promise<R> },
-  fn: (client: PoolClient) => Promise<T>,
-  retryOptions: RetryOptions = {}
-): Promise<T> {
-  const {
-    maxRetries = 3,
-    initialBackoffMs = 50,
-    maxBackoffMs = 1000,
-    operationName = 'database operation',
-    debugLogging = false,
-  } = retryOptions
-
-  let lastError: Error | undefined
-  let attempt = 0
-  let lastBackoffMs = 0
-  let lastConflictCode: ConflictRetryInfo['conflictCode'] | undefined
-
-  while (attempt <= maxRetries) {
-    try {
-      const result = await transactionManager.withTransaction(fn)
-
-      // Success! Log if this was a retry
-      if (attempt > 0) {
-        logger.info({
-          message: `${operationName} succeeded after ${attempt} retries`,
-          operationName,
-          attempts: attempt,
-        })
-      }
-
-      return result
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error))
-      lastConflictCode = classifyConflict(error) ?? lastConflictCode
-
-      // Check if this is a retryable error
-      if (!isRetryableError(error)) {
-        if (debugLogging) {
-          logger.debug({
-            message: `${operationName} failed with non-retryable error`,
-            operationName,
-            errorCode: (error as any)?.code,
-            errorMessage: lastError.message,
-          })
-        }
-        throw error
-      }
-
-      // Check if we've exhausted retries
-      if (attempt >= maxRetries) {
-        logger.warn({
-          message: `${operationName} failed after ${attempt} retries`,
-          operationName,
-          attempts: attempt,
-          errorCode: (error as any)?.code,
-          errorMessage: lastError.message,
-        })
-
-        // Surface a ConflictError with retry-after semantics when exhausted
-        // due to a concurrency conflict.
-        if (lastConflictCode) {
-          throw new ConflictError(
-            `${operationName} failed after ${attempt} retries due to concurrent conflict: ${lastError.message}`,
-            {
-              retryAfterSeconds: Math.ceil(lastBackoffMs / 1000) || 1,
-              attempts: attempt,
-              conflictCode: lastConflictCode,
-            },
-            lastError,
-          )
-        }
-
-        throw new MaxRetriesExhaustedError(attempt, lastError, operationName)
-      }
-
-      // Calculate backoff and retry
-      lastBackoffMs = calculateBackoffMs(attempt, initialBackoffMs, maxBackoffMs)
-      
-      if (debugLogging) {
-        logger.debug({
-          message: `${operationName} attempt ${attempt + 1} failed, retrying after ${lastBackoffMs}ms`,
-          operationName,
-          attempt: attempt + 1,
-          maxRetries,
-          backoffMs: lastBackoffMs,
-          errorCode: (error as any)?.code,
-          errorMessage: lastError.message,
-        })
-      }
-
-      await sleep(lastBackoffMs)
-      attempt++
-    }
-  }
-
-  // This should never be reached, but TypeScript needs it
-  throw new MaxRetriesExhaustedError(
-    attempt,
-    lastError ?? new Error('Unknown error'),
-    operationName
+    operationName,
   )
 }
