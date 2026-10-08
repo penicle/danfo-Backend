@@ -1,0 +1,635 @@
+import { Horizon } from '@stellar/stellar-sdk'
+import type { Pool, PoolClient } from 'pg'
+import { Gauge, register } from 'prom-client'
+import { pool as defaultPool } from '../db/pool.js'
+import { CursorRepository } from '../db/repositories/cursorRepository.js'
+import { IdempotencyRepository } from '../db/repositories/idempotencyRepository.js'
+import { upsertCursor } from '../services/identityService.js'
+import { createIdempotentConsumer, IdempotentConsumer } from '../services/idempotentConsumer.js'
+import {
+  recordHorizonListenerHeartbeat,
+  setHorizonListenerConfigured,
+  setHorizonListenerRunning,
+} from '../services/health/runtimeState.js'
+import { withdrawalEventSchema } from '../schemas/queue.js'
+import { validateMessage } from './messageValidator.js'
+import {
+  computeNewBondAmount,
+  shouldTakeSnapshot,
+} from '../lib/bondAmountMath.js'
+
+/**
+ * Interface for bond withdrawal event data
+ */
+export interface WithdrawalEvent {
+  id: string
+  pagingToken: string
+  type: string
+  createdAt: Date
+  bondId: string
+  account: string
+  amount: string
+  assetType: string
+  assetCode?: string
+  assetIssuer?: string
+  transactionHash: string
+  operationIndex: number
+}
+
+/**
+ * Interface for bond state updates
+ */
+export interface BondStateUpdate {
+  bondId: string
+  account: string
+  previousAmount?: string
+  newAmount: string
+  isActive: boolean
+  updatedAt: Date
+  transactionHash: string
+}
+
+/**
+ * Interface for score history snapshot
+ */
+export interface ScoreHistorySnapshot {
+  address: string
+  score: number
+  bondedAmount: string
+  timestamp: Date
+  reason: 'withdrawal_full' | 'withdrawal_partial'
+  transactionHash: string
+}
+
+const STREAM_NAME = 'bond_withdrawal'
+
+/**
+ * Strip insignificant trailing zeros from an exact decimal string (e.g.
+ * "700.0000000" -> "700", "133.3300000" -> "133.33"). Pure string
+ * manipulation — never round-trips through Number — so it preserves the
+ * `subtractDecimals` output's exactness while matching the trimmed shape
+ * `parseFloat(...).toString()` used to produce, for backward compatibility.
+ */
+function trimTrailingZeros(decimal: string): string {
+  if (!decimal.includes('.')) return decimal
+  return decimal.replace(/\.?0+$/, '') || '0'
+}
+
+const cursorLagGauge = (register.getSingleMetric('horizon_listener_cursor_lag_seconds') as Gauge<string> | undefined)
+  ?? new Gauge({
+    name: 'horizon_listener_cursor_lag_seconds',
+    help: 'Time elapsed since last Horizon cursor checkpoint',
+    labelNames: ['stream_name'],
+    registers: [register],
+  })
+
+const lastCheckpointGauge = (register.getSingleMetric('horizon_listener_last_checkpoint_timestamp') as Gauge<string> | undefined)
+  ?? new Gauge({
+    name: 'horizon_listener_last_checkpoint_timestamp',
+    help: 'Unix timestamp of last Horizon cursor checkpoint',
+    labelNames: ['stream_name'],
+    registers: [register],
+  })
+
+/**
+ * Configuration for the Horizon withdrawal listener
+ */
+export interface HorizonListenerConfig {
+  horizonUrl: string
+  networkPassphrase: string
+  bondContractAddress?: string
+  withdrawalAsset?: {
+    code: string
+    issuer: string
+  }
+  pollingInterval?: number // milliseconds
+  lastCursor?: string
+}
+
+/**
+ * Horizon listener for bond withdrawal events
+ * 
+ * Monitors Stellar Horizon for withdrawal transactions that affect bond states
+ * and updates the local bond records accordingly.
+ */
+export class HorizonWithdrawalListener {
+  private server: Horizon.Server
+  private config: HorizonListenerConfig
+  private isRunning = false
+  private pollTimer?: NodeJS.Timeout
+  private lastCursor: string
+  private replayService: { captureFailure: (type: string, data: any, reason: string) => Promise<any> }
+  private readonly pool: Pool
+  private readonly cursorRepo: CursorRepository
+  /**
+   * Guards each withdrawal operation (`STREAM_NAME:event.id`) against being
+   * applied more than once. `event.id` is Horizon's own globally unique
+   * operation id, so this is stable across process restarts and across
+   * however many replicas ever poll this stream — it is the mechanism that
+   * makes a crash-and-replay of an already-committed event a safe no-op
+   * instead of a double-apply.
+   */
+  private readonly idempotency: IdempotentConsumer<unknown, void>
+
+  constructor(
+    config: HorizonListenerConfig,
+    replayService: { captureFailure: (type: string, data: any, reason: string) => Promise<any> } = {
+      captureFailure: async () => ({}),
+    },
+    pool: Pool = defaultPool,
+  ) {
+    this.config = config
+    this.server = new Horizon.Server(config.horizonUrl)
+    this.pool = pool
+    this.cursorRepo = new CursorRepository(pool)
+    this.idempotency = createIdempotentConsumer<unknown, void>(new IdempotencyRepository(pool), {
+      actorId: 'horizon-withdrawal-listener',
+    })
+    this.lastCursor = config.lastCursor || 'now'
+    this.replayService = replayService
+    setHorizonListenerConfigured(true)
+  }
+
+  /**
+   * Start listening for withdrawal events
+   * Loads saved cursor on startup for gap-free resume
+   */
+  public async start(): Promise<void> {
+    if (this.isRunning) {
+      console.warn('Horizon withdrawal listener is already running')
+      return
+    }
+
+    // Load saved cursor on startup, fall back to 'now' on first run
+    const savedCursor = await this.cursorRepo.findByStreamName(STREAM_NAME)
+    if (savedCursor) {
+      this.lastCursor = savedCursor.pagingToken
+      console.log(`[${STREAM_NAME}] Resuming from saved cursor: ${this.lastCursor}`)
+    } else {
+      console.log(`[${STREAM_NAME}] No saved cursor found, starting from: ${this.lastCursor}`)
+    }
+
+    this.isRunning = true
+    setHorizonListenerRunning(true)
+    recordHorizonListenerHeartbeat(this.lastCursor)
+    console.log(`Starting Horizon withdrawal listener for ${this.config.horizonUrl}`)
+
+    // Start polling for events
+    await this.pollForEvents()
+  }
+
+  /**
+   * Stop listening for withdrawal events
+   */
+  public async stop(): Promise<void> {
+    if (!this.isRunning) {
+      return
+    }
+
+    this.isRunning = false
+    setHorizonListenerRunning(false)
+    
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer)
+      this.pollTimer = undefined
+    }
+
+    console.log('Stopped Horizon withdrawal listener')
+  }
+
+  /**
+   * Check if the listener is currently running
+   */
+  public isActive(): boolean {
+    return this.isRunning
+  }
+
+  /**
+   * Get the current cursor position
+   */
+  public getCursor(): string {
+    return this.lastCursor
+  }
+
+  /**
+   * Set the cursor position for resuming from a specific point
+   */
+  public setCursor(cursor: string): void {
+    this.lastCursor = cursor
+  }
+
+  /**
+   * Poll for new withdrawal events from Horizon
+   */
+  private async pollForEvents(): Promise<void> {
+    if (!this.isRunning) {
+      return
+    }
+
+    try {
+      const events = await this.fetchWithdrawalEvents()
+      
+      if (events.length > 0) {
+        console.log(`[${STREAM_NAME}] Processing ${events.length} withdrawal events`)
+        
+        for (const event of events) {
+          const validation = validateMessage(withdrawalEventSchema, event)
+          if (!validation.valid) {
+            // Permanently malformed payloads can never pass validation on a
+            // retry, so route to the DLQ and advance past them — otherwise
+            // the next poll would fetch this same poison event forever.
+            await this.replayService.captureFailure(
+              STREAM_NAME,
+              event,
+              `[${validation.reasonCode}] ${validation.detail}`,
+            )
+            await this.commitCursor(event.pagingToken)
+            this.lastCursor = event.pagingToken
+            continue
+          }
+
+          // The event mutation and the cursor checkpoint are one durable
+          // unit (mirrors horizonBondEvents.ts): if the process crashes
+          // before COMMIT, the cursor never moved, so the next poll refetches
+          // this same event from Horizon and retries it. The idempotency
+          // guard additionally protects against the same operation id ever
+          // being *applied* twice — whether from overlapping poll windows,
+          // concurrent replicas of this listener, or a manual replay.
+          const outcome = await this.idempotency.process(`${STREAM_NAME}:${event.id}`, async () => {
+            const client: PoolClient = await this.pool.connect()
+            try {
+              await client.query('BEGIN')
+              await this.processWithdrawalEvent(event)
+              await upsertCursor({ streamName: STREAM_NAME, pagingToken: event.pagingToken }, client)
+              await client.query('COMMIT')
+            } catch (txErr) {
+              await client.query('ROLLBACK')
+              throw txErr
+            } finally {
+              client.release()
+            }
+          })
+
+          if (!outcome.success) {
+            // Stop the batch at the first failure and do NOT advance past
+            // it. Nothing from this event was committed (the transaction
+            // rolled back), so the next poll cycle retries it from the same
+            // cursor — a bounded, automatic retry with no partial state and
+            // no silent gap.
+            throw new Error(outcome.error ?? `Failed to process withdrawal event ${event.id}`)
+          }
+
+          this.lastCursor = event.pagingToken
+        }
+        
+        // Update metrics after batch processing
+        await this.updateMetrics()
+      }
+
+      // Poll completed and cursor is current; mark heartbeat.
+      recordHorizonListenerHeartbeat(this.lastCursor)
+
+    } catch (error) {
+      console.error('Error polling for withdrawal events:', error)
+    }
+
+    // Schedule next poll
+    if (this.isRunning) {
+      this.pollTimer = setTimeout(
+        () => this.pollForEvents(),
+        this.config.pollingInterval || 5000
+      )
+    }
+  }
+
+  /**
+   * Persist a cursor checkpoint on its own, for events that are permanently
+   * skipped (poison messages) rather than processed.
+   */
+  private async commitCursor(pagingToken: string): Promise<void> {
+    const client: PoolClient = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      await upsertCursor({ streamName: STREAM_NAME, pagingToken }, client)
+      await client.query('COMMIT')
+    } catch (txErr) {
+      await client.query('ROLLBACK')
+      throw txErr
+    } finally {
+      client.release()
+    }
+  }
+
+  /**
+   * Fetch withdrawal events from Horizon
+   */
+  private async fetchWithdrawalEvents(): Promise<WithdrawalEvent[]> {
+    try {
+      const operationsBuilder = this.server
+        .operations()
+        .order('asc')
+        .limit(100)
+        .cursor(this.lastCursor)
+
+      // Filter for payment operations that represent withdrawals
+      const response = await operationsBuilder.call()
+      
+      const withdrawalEvents: WithdrawalEvent[] = []
+
+      for (const record of response.records) {
+        if (this.isWithdrawalOperation(record)) {
+          const event = this.parseWithdrawalEvent(record)
+          if (event) {
+            withdrawalEvents.push(event)
+          }
+        }
+      }
+
+      return withdrawalEvents
+    } catch (error) {
+      console.error('Error fetching withdrawal events from Horizon:', error)
+      return []
+    }
+  }
+
+  /**
+   * Check if an operation represents a withdrawal
+   */
+  private isWithdrawalOperation(operation: Horizon.ServerApi.OperationRecord): boolean {
+    // Only process payment operations
+    if (operation.type !== 'payment') {
+      return false
+    }
+
+    const payment = operation as Horizon.ServerApi.PaymentOperationRecord
+    
+    // Check if it's a withdrawal from bond contract or to specific account
+    if (this.config.bondContractAddress) {
+      // Withdrawal from bond contract (source is bond contract)
+      return payment.source_account === this.config.bondContractAddress
+    }
+
+    // If no specific contract configured, treat all payments as potential withdrawals
+    // In production, this should be more specific based on business logic
+    return true
+  }
+
+  /**
+   * Parse a withdrawal event from a Horizon operation record
+   */
+  private parseWithdrawalEvent(operation: Horizon.ServerApi.OperationRecord): WithdrawalEvent | null {
+    if (operation.type !== 'payment') {
+      return null
+    }
+
+    const payment = operation as Horizon.ServerApi.PaymentOperationRecord
+
+    return {
+      id: operation.id,
+      pagingToken: operation.paging_token,
+      type: operation.type,
+      createdAt: new Date(operation.created_at),
+      bondId: this.extractBondId(operation),
+      account: payment.from || payment.source_account,
+      amount: payment.amount,
+      assetType: payment.asset_type,
+      assetCode: payment.asset_code,
+      assetIssuer: payment.asset_issuer,
+      transactionHash: operation.transaction_hash || '',
+      operationIndex: Number.parseInt(operation.id.split('-').pop() ?? '0', 10) || 0
+    }
+  }
+
+  /**
+   * Extract bond ID from operation details
+   * This would depend on how bond IDs are encoded in transactions
+   */
+  private extractBondId(operation: Horizon.ServerApi.OperationRecord): string {
+    // In a real implementation, this would extract the bond ID from:
+    // 1. Memo field
+    // 2. Transaction metadata
+    // 3. Operation details
+    // For now, use a combination of account and transaction hash
+    const payment = operation as Horizon.ServerApi.PaymentOperationRecord
+    return `${payment.from || payment.source_account}-${operation.transaction_hash}`
+  }
+
+  /**
+   * Process a single withdrawal event
+   */
+  private async processWithdrawalEvent(event: WithdrawalEvent): Promise<void> {
+    try {
+      console.log(`Processing withdrawal event: ${event.id}`)
+
+      // Get current bond state
+      const currentBond = await this.getBondState(event.bondId, event.account)
+      
+      if (!currentBond) {
+        console.warn(`Bond not found for withdrawal event: ${event.bondId}`)
+        return
+      }
+
+      // Calculate new bond state
+      const bondUpdate = this.calculateBondUpdate(currentBond, event)
+      
+      // Update bond state
+      await this.updateBondState(bondUpdate)
+      
+      // Create score history snapshot if needed
+      if (this.shouldCreateScoreSnapshot(bondUpdate)) {
+        const snapshot = await this.createScoreSnapshot(currentBond, event)
+        await this.saveScoreSnapshot(snapshot)
+      }
+
+      console.log(`Updated bond ${event.bondId}: ${bondUpdate.newAmount} (active: ${bondUpdate.isActive})`)
+
+    } catch (error: any) {
+      console.error(`Error processing withdrawal event ${event.id}:`, error)
+      await this.replayService.captureFailure('withdrawal', event, error.message)
+      // Re-throw so the caller's transaction rolls back and the cursor is
+      // NOT advanced past this event — a transient failure must be retried,
+      // not silently treated as done.
+      throw error
+    }
+  }
+
+  /**
+   * Get current bond state from database
+   */
+  private async getBondState(bondId: string, account: string): Promise<any> {
+    // In a real implementation, this would query the database
+    // For now, return mock data
+    return {
+      bondId,
+      account,
+      amount: '1000.0000000',
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date()
+    }
+  }
+
+  /**
+   * Calculate bond state update based on withdrawal event.
+   *
+   * Delegates to `computeNewBondAmount` (src/lib/bondAmountMath.ts) which
+   * uses exact BigInt-scaled arithmetic so that amounts with more than 15
+   * significant digits are never silently truncated by IEEE 754 conversion.
+   *
+   * Invariants enforced before any state change:
+   *   - Both amounts must be non-negative decimal strings (no sign, no exponent).
+   *   - The result is clamped to "0" when withdrawal >= current balance;
+   *     negative balances cannot be produced.
+   */
+  private calculateBondUpdate(currentBond: any, event: WithdrawalEvent): BondStateUpdate {
+    const newAmount = computeNewBondAmount(
+      String(currentBond.amount),
+      String(event.amount),
+    )
+    const isActive = newAmount !== '0'
+
+    return {
+      bondId: event.bondId,
+      account: event.account,
+      previousAmount: currentBond.amount,
+      newAmount,
+      isActive,
+      updatedAt: new Date(),
+      transactionHash: event.transactionHash,
+    }
+  }
+
+  /**
+   * Update bond state in database
+   */
+  private async updateBondState(update: BondStateUpdate): Promise<void> {
+    // In a real implementation, this would update the database
+    console.log(`Updating bond state:`, JSON.stringify(update, null, 2))
+    
+    // Mock database update
+    // await db.bonds.update({ bondId: update.bondId }, update)
+  }
+
+  /**
+   * Determine if a score history snapshot should be created.
+   *
+   * Delegates to `shouldTakeSnapshot` (src/lib/bondAmountMath.ts) which uses
+   * exact BigInt division for the 50 % ratio test, eliminating floating-point
+   * midpoint imprecision that affected the previous `parseFloat` implementation.
+   */
+  private shouldCreateScoreSnapshot(update: BondStateUpdate): boolean {
+    return shouldTakeSnapshot(
+      String(update.previousAmount ?? '0'),
+      String(update.newAmount),
+      update.isActive,
+    )
+  }
+
+  /**
+   * Create score history snapshot
+   */
+  private async createScoreSnapshot(currentBond: any, event: WithdrawalEvent): Promise<ScoreHistorySnapshot> {
+    // In a real implementation, this would calculate the current score
+    const currentScore = await this.calculateTrustScore(currentBond.account)
+
+    // Exact comparison: full withdrawal when event.amount >= currentBond.amount.
+    // computeNewBondAmount returns "0" when withdrawal >= current.
+    const newAmount = computeNewBondAmount(
+      String(currentBond.amount),
+      String(event.amount),
+    )
+    const isFullWithdrawal = newAmount === '0'
+
+    return {
+      address: currentBond.account,
+      score: currentScore,
+      bondedAmount: currentBond.amount,
+      timestamp: new Date(),
+      reason: isFullWithdrawal ? 'withdrawal_full' : 'withdrawal_partial',
+      transactionHash: event.transactionHash,
+    }
+  }
+
+  /**
+   * Calculate trust score for an account
+   */
+  private async calculateTrustScore(address: string): Promise<number> {
+    // In a real implementation, this would calculate the trust score
+    // based on various factors including bond amount, history, etc.
+    return 85 // Mock score
+  }
+
+  /**
+   * Save score history snapshot to database
+   */
+  private async saveScoreSnapshot(snapshot: ScoreHistorySnapshot): Promise<void> {
+    // In a real implementation, this would save to the database
+    console.log(`Creating score history snapshot:`, JSON.stringify(snapshot, null, 2))
+    
+    // Mock database save
+    // await db.scoreHistory.create(snapshot)
+  }
+
+  /**
+   * Get listener statistics
+   */
+  public getStats(): {
+    isRunning: boolean
+    horizonUrl: string
+    lastCursor: string
+    pollingInterval: number
+  } {
+    return {
+      isRunning: this.isRunning,
+      horizonUrl: this.config.horizonUrl,
+      lastCursor: this.lastCursor,
+      pollingInterval: this.config.pollingInterval || 5000
+    }
+  }
+
+  /**
+   * Update Prometheus metrics for cursor monitoring
+   */
+  private async updateMetrics(): Promise<void> {
+    try {
+      const lag = await this.cursorRepo.getCursorLag(STREAM_NAME)
+      if (lag !== null) {
+        cursorLagGauge.set({ stream_name: STREAM_NAME }, lag)
+      }
+      
+      const cursor = await this.cursorRepo.findByStreamName(STREAM_NAME)
+      if (cursor) {
+        lastCheckpointGauge.set(
+          { stream_name: STREAM_NAME },
+          Math.floor(cursor.lastCheckpoint.getTime() / 1000)
+        )
+      }
+    } catch (err) {
+      console.error(`[${STREAM_NAME}] Error updating metrics:`, err)
+    }
+  }
+}
+
+/**
+ * Factory function to create a configured Horizon withdrawal listener
+ * @param config - Partial configuration to override defaults
+ * @param pool - PostgreSQL connection pool for cursor persistence
+ * @param replayService - Service to capture failed events for replay
+ */
+export function createHorizonWithdrawalListener(
+  config: Partial<HorizonListenerConfig> = {},
+  pool: Pool = defaultPool,
+  replayService: { captureFailure: (type: string, data: any, reason: string) => Promise<any> } = { captureFailure: async () => ({}) }
+): HorizonWithdrawalListener {
+  const defaultConfig: HorizonListenerConfig = {
+    horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
+    networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
+    pollingInterval: 5000,
+    lastCursor: 'now'
+  }
+
+  return new HorizonWithdrawalListener({ ...defaultConfig, ...config }, replayService, pool)
+}
+
+export const horizonWithdrawalListener = createHorizonWithdrawalListener()
+

@@ -282,7 +282,7 @@ describe('resolveSafeRedirectTarget', () => {
     expect(caught).toBeInstanceOf(UnsafeRedirectError)
     const appError = caught as UnsafeRedirectError
     expect(appError.code).toBe('unsafe_redirect_target')
-    expect(appError.status).toBe400)
+    expect(appError.status).toBe(400)
   })
 
   it('throws for a disallowed absolute host', () => {
@@ -308,7 +308,7 @@ describe('resolveSafeRedirectTarget', () => {
     } catch (err) {
       caught = err
     }
-    expect(caught).toBeInceanceOf(UnsafeRedirectError)
+    expect(caught).toBeInstanceOf(UnsafeRedirectError)
     const appError = caught as UnsafeRedirectError
     expect(appError.code).toBe('unsafe_redirect_target')
     expect(appError.status).toBe(400)

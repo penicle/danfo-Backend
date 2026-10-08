@@ -1,700 +1,230 @@
-# Credence Backend
+# Danfo Backend
 
-[![codecov](https://codecov.io/gh/CredenceOrg/Credence-Backend/branch/main/graph/badge.svg)](https://codecov.io/gh/CredenceOrg/Credence-Backend)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.2+-blue.svg)](https://www.typescriptlang.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
 
-API and services for the Credence economic trust protocol. Provides health checks, trust score and bond status endpoints (to be wired to Horizon and a reputation engine).
+API and backend services for the Danfo economic trust protocol. Provides public trust querying, on-chain bond lifecycle tracking, dispute resolution, attestation records, and background event reconciliation with Stellar Horizon and Soroban smart contracts.
 
-## About
+---
 
-This service is part of [Credence](../README.md). It supports:
+## Architecture & Monorepo Structure
 
-- Public query API (trust score, bond status, attestations)
-- Horizon listener for bond withdrawal events
-- Redis-based caching layer
-- **Configurable lock timeouts** – Prevents indefinite waits on locked rows with policy-based timeouts and automatic retry
-- **Horizon listener / identity state sync** – Reconciles DB with on-chain bond state (see [Identity state sync](#identity-state-sync)).
-- **Shadow write mode for safe pipeline migration** – Validates new settlement pipeline by writing to both old and new simultaneously and comparing results in metrics (see [Shadow Write Mode](docs/SHADOW_WRITE_MODE.md))
-- Reputation engine (off-chain score from bond data) (future)
-- **Downstream service dependencies**: see [docs/SERVICE_MAP.md](docs/SERVICE_MAP.md) for every external service the backend calls.
+The repository is structured as a modular TypeScript monorepo using npm workspaces:
+
+```
+danfo-Backend/
+├── packages/
+│   ├── core/              # @danfo/core: Database, domain models, cache, schemas, utilities
+│   │   ├── src/db/        # PostgreSQL connection pool, queries, outbox repository
+│   │   ├── src/services/  # Core business logic (bonds, analytics, attestations, key management)
+│   │   ├── src/cache/     # Redis client, caching abstractions, invalidation bus
+│   │   ├── src/schemas/   # Centralized Zod request & response validation schemas
+│   │   └── src/lib/       # Error catalogs, retry policies, domain constants
+│   └── api/               # @danfo/api: Express HTTP service, routes, middleware, jobs
+│       ├── src/routes/    # REST API endpoints (health, trust, bond, admin, payouts, webhooks)
+│       ├── src/middleware/# Rate limiting, security headers, metrics, tenant context
+│       ├── src/jobs/      # Schedulers, sweepers, outbox publisher, reconcilers
+│       └── src/index.ts   # HTTP listener and WebSocket subscription server entrypoint
+├── src/                   # Root source entrypoint & compatibility layer
+├── scripts/               # Migration checkers, integrity verification, drills, utilities
+├── tests/                 # Integration, chaos, and end-to-end test suites
+└── docs/                  # Architecture, API specs, runbooks, and operator manuals
+```
+
+### Key Capabilities
+
+- **High-Performance Trust API**: Endpoints for trust scores, bond status, attestations, and analytics.
+- **On-Chain Identity & Event Sync**: Horizon listener for bond events and real-time state reconciliation.
+- **Enterprise Caching & Invalidation**: Redis L1/L2 multi-tier caching with PostgreSQL LISTEN/NOTIFY invalidation bus.
+- **Reliable Outbox Pattern**: Transactional outbox event publishing with deduplication and lease-based distributed workers.
+- **Resilient Retry & Circuit Breaker**: Exponential backoff with jitter and fail-fast circuit breakers across downstream dependencies.
+- **Structured Observability**: Prometheus metrics, Grafana dashboards, OpenTelemetry distributed tracing, and audit logs.
+
+---
 
 ## Prerequisites
 
-- Node.js 18+
-- npm or pnpm
-- Redis server (for caching)
-- Stellar Horizon server (for blockchain events)
-- @stellar/stellar-sdk (Stellar blockchain integration)
-- Docker & Docker Compose (for containerised dev)
+- **Node.js**: 18.x or later (v20+ recommended)
+- **npm** or **pnpm**
+- **PostgreSQL**: 15+ (PostgreSQL 16 recommended)
+- **Redis**: 7+ (for caching and rate limiting)
+- **Docker & Docker Compose**: (optional, for local containerized environment)
+- **Stellar Horizon**: Horizon server instance for on-chain event streams
 
-## Setup
+---
+
+## Getting Started
+
+### 1. Installation
 
 ```bash
+git clone https://github.com/DanfoOrg/danfo-Backend.git
+cd danfo-Backend
 npm install
-# Set Redis URL in environment
-export REDIS_URL=redis://localhost:6379
-# Set Horizon URL for blockchain events
-export HORIZON_URL=https://horizon-testnet.stellar.org
-# Set Stellar network passphrase
-export STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+```
+
+### 2. Environment Configuration
+
+Copy the example environment configuration file and update it with your credentials:
+
+```bash
 cp .env.example .env
-# Edit .env with your actual values
 ```
 
-The server **fails fast** on startup if any required environment variable is missing or invalid. See [Environment Variables](#environment-variables) below.
+Key environment variables:
 
-## Run locally
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | HTTP listener port |
+| `NODE_ENV` | `development` | Runtime environment (`development`, `production`, `test`) |
+| `DB_URL` | — | PostgreSQL connection string (`postgres://user:pass@host:5432/db`) |
+| `REDIS_URL` | — | Redis connection URL (`redis://localhost:6379`) |
+| `JWT_SECRET` | — | Secret string for JWT signing/verification (minimum 32 characters) |
+| `HORIZON_URL` | — | Stellar Horizon API endpoint |
+| `STELLAR_NETWORK_PASSPHRASE` | — | Network passphrase for Stellar / Soroban network |
 
-**Development (watch mode):**
+Detailed configuration documentation with all available options is located in **[docs/CONFIG_TEMPLATE.md](docs/CONFIG_TEMPLATE.md)**.
+
+---
+
+## Running the Application
+
+### Development Mode
+
+Run the backend with file-watching and automated pending migration checks:
 
 ```bash
+# Start root development server
 npm run dev
+
+# Or start the @danfo/api workspace directly
+npm run dev:api
 ```
 
-`npm run dev` automatically checks for pending database migrations before starting the dev server. If any are found, a reminder to run `npm run migrate:dev` is printed. Set `DATABASE_URL` in your environment to enable this check.
+The server boots on [http://localhost:3000](http://localhost:3000).
 
-**Production:**
+### Production Build
 
 ```bash
+# Build TypeScript artifacts
 npm run build
+
+# Start production server
 npm start
 ```
 
-API runs at [http://localhost:3000](http://localhost:3000). The frontend proxies `/api` to this URL.
+### Workspace Commands
+
+```bash
+# Typecheck @danfo/core
+npm run build:core
+
+# Typecheck @danfo/api
+npm run build:api
+```
 
 ---
 
-## Docker (recommended for local dev)
+## Docker Deployment (Local Stack)
 
-The project ships with **Dockerfile**, **docker-compose.yml**, and an example env file so you can spin up the full stack (API + PostgreSQL + Redis) in one command.
-
-### Quick start
+Run the complete stack (API, PostgreSQL, Redis, Prometheus, Grafana) with Docker Compose:
 
 ```bash
-# 1. Create your local env file
-cp .env.example .env
-
-# 2. Build and start all services
+# Launch all services
 docker compose up --build
 
-# 3. Verify health
+# Verify health status
 curl http://localhost:3000/api/health
-# → {"status":"ok","service":"credence-backend"}
 ```
 
-### Services
-
-| Service    | Port | Description              |
-| ---------- | ---- | ------------------------ |
-| `backend`  | 3000 | Express / TypeScript API |
-| `postgres` | 5432 | PostgreSQL 16            |
-| `redis`    | 6379 | Redis 7                  |
-
-All ports are configurable via `.env` (see `.env.example`).
-
-### Seeding the database
-
-Drop any `.sql` files into the `init-db/` directory. PostgreSQL will execute them **once** when the data volume is first created. A placeholder file (`init-db/001_schema.sql`) is included as a starting point.
-
-To re-run init scripts, remove the volume and restart:
+To stop containers and clean up data volumes:
 
 ```bash
-docker compose down -v   # removes data volumes
-docker compose up --build
-```
-
-### Useful commands
-
-```bash
-# Stop all services
-docker compose down
-
-# Stop and remove volumes (reset DB/Redis data)
 docker compose down -v
-
-# View logs
-docker compose logs -f backend
-
-# Rebuild only the backend image
-docker compose build backend
-
-# Open a psql shell
-docker compose exec postgres psql -U credence
 ```
-
-### Environment variables
-
-All configuration is driven by environment variables. Copy `.env.example` to `.env` and adjust as needed. The full reference — every required and optional variable with defaults, validation bounds, and common pitfalls — is in **[docs/CONFIG_TEMPLATE.md](docs/CONFIG_TEMPLATE.md)**. Key variables:
-
-| Variable            | Default    | Description               |
-| ------------------- | ---------- | ------------------------- |
-| `PORT`              | `3000`     | Backend listen port       |
-| `POSTGRES_USER`     | `credence` | PostgreSQL user           |
-| `POSTGRES_PASSWORD` | `credence` | PostgreSQL password       |
-| `POSTGRES_DB`       | `credence` | PostgreSQL database name  |
-| `POSTGRES_PORT`     | `5432`     | Host-exposed PG port      |
-| `REDIS_PORT`        | `6379`     | Host-exposed Redis port   |
-| `DATABASE_URL`      | (composed) | Full PG connection string |
-| `REDIS_URL`         | (composed) | Full Redis connection URL |
-| `MAINTENANCE_MODE_ENABLED` | `false` | Reject mutating requests with `503` and `Retry-After` while maintenance is active |
-| `MAINTENANCE_MODE_RETRY_AFTER_SECONDS` | `60` | Retry window to return on maintenance-mode responses |
 
 ---
-
-## Scripts
-
-| Command                   | Description                                |
-| ------------------------- | ------------------------------------------ |
-| `npm run dev`             | Check pending migrations, then start with tsx watch |
-| `npm run build`           | Compile TypeScript                         |
-| `npm start`               | Run compiled `dist/`                       |
-| `npm run lint`            | Run ESLint                                 |
-| `npm run lint:fix`        | Run ESLint and auto-fix violations         |
-| `npm test`                | Run test suite (vitest)                    |
-| `npm run test:watch`      | Run tests in watch mode                    |
-| `npm run test:coverage`   | Run tests with coverage                    |
-| `npm run migrate:create`  | Create new migration in `src/migrations/`  |
-| `npm run migrate:dev`     | Build and run pending migrations (local)   |
-| `npm run migrate`         | Run pending migrations (CI/production)     |
-| `npm run migrate:down`    | Rollback last migration                    |
-| `npm run migrate:dry-run` | Preview pending migrations without running |
-| `npm run test:db:reset`   | Drop, recreate, and migrate local test DB  |
-
-## Developer Setup
-
-### Lint on save (VS Code)
-
-The repository ships with `.vscode/settings.json` and `.vscode/extensions.json` so ESLint auto-fixes your code every time you save a TypeScript file — no extra configuration needed.
-
-**Prerequisites:** Install the recommended extension when VS Code prompts you, or run:
-
-```
-Extensions: Show Recommended Extensions   # Ctrl+Shift+P → type "Show Recommended"
-```
-
-The extension ID is `dbaeumer.vscode-eslint`.
-
-**How it works:**
-
-- `.vscode/settings.json` sets `editor.codeActionsOnSave` → `source.fixAll.eslint: "explicit"`, which triggers ESLint's `--fix` pass on every explicit save (`Ctrl+S` / `⌘S`).
-- `eslint.useFlatConfig: true` tells the extension to use the project's `eslint.config.js` flat-config format.
-- `[typescript].editor.defaultFormatter` is set to the ESLint extension so format-on-save routes through ESLint rather than a separate formatter.
-
-**CLI equivalent** (safe to re-run, idempotent):
-
-```bash
-npm run lint        # check only — exits non-zero if there are errors
-npm run lint:fix    # check and auto-fix — writes changes in place
-```
-
-Both commands target `src/` and respect the ignore patterns in `eslint.config.js` (e.g. `dist/`, `**/*.test.ts`).
-
----
-
-## API (current)
-
-| Method | Path                         | Description                                 |
-| ------ | ---------------------------- | ------------------------------------------- |
-| GET    | `/api/health`                | Health check                                |
-| GET    | `/api/health/cache`          | Redis cache health check                    |
-| GET    | `/api/trust/:address`        | Trust score from reputation engine          |
-| GET    | `/api/bond/:address`         | Bond status                                 |
-| GET    | `/api/attestations/:address` | List attestations for address               |
-| POST   | `/api/attestations`          | Create attestation                          |
-| GET    | `/api/verification/:address` | Verification proof (stub)                   |
-| GET    | `/api/analytics/summary`     | Aggregated analytics from materialized view |
-| GET    | `/api/reports/top-talkers`   | Top N tenants by request count in last hour |
-| GET    | `/api/admin/system/backup-status` | Admin endpoint: Returns the backup job status (stale if > 24h) |
-| POST   | `/api/payouts`                    | Create a payout (settlement). Idempotent via `Idempotency-Key` header — see [docs/IDEMPOTENCY.md](docs/IDEMPOTENCY.md). Requires `payouts:write` scope. |
-
-
-Invalid input returns **400** with `{ "error": "Validation failed", "details": [{ "path", "message" }] }`. See [docs/VALIDATION.md](docs/VALIDATION.md).
-
-Every API error carries a stable error code and an HTTP status. The full reference with remediation for each status and code: **[docs/HTTP_STATUS_REFERENCE.md](docs/HTTP_STATUS_REFERENCE.md)** and **[docs/API_ERROR_TAXONOMY.md](docs/API_ERROR_TAXONOMY.md)**.
-
-List endpoints support offset/page and cursor-based pagination. See **[docs/PAGINATION_CONTRACT.md](docs/PAGINATION_CONTRACT.md)** for cursor format, page-size limits, and ordering guarantees.
-
-Full request/response documentation, cURL examples, and import instructions:
-**[docs/api.md](docs/api.md)**
-
-**API versioning & stability policy:** **[docs/API_STABILITY.md](docs/API_STABILITY.md)**  
-**API deprecation policy:** **[docs/DEPRECATION_POLICY.md](docs/DEPRECATION_POLICY.md)**  
-**API change log & format guide:** **[docs/API_CHANGELOG.md](docs/API_CHANGELOG.md)**
-
-### OpenAPI spec
-
-```
-docs/openapi.yaml
-```
-
-Render with `npx @redocly/cli preview-docs docs/openapi.yaml` or paste into [editor.swagger.io](https://editor.swagger.io).
-
-For instructions on how to regenerate the spec after modifying schemas or routes, see **[docs/OPENAPI.md](docs/OPENAPI.md)**.
-
-The full request/response pipeline — from Zod schema definition to OpenAPI generation to frontend client types — is documented in **[docs/TYPE_SAFETY.md](docs/TYPE_SAFETY.md)**.
-
-### Postman / Insomnia collection
-
-```
-docs/credence.postman_collection.json
-```
-
-Import via **File → Import** in Postman or Insomnia. See [docs/api.md](docs/api.md#importing-the-postman-collection) for step-by-step instructions and Newman CLI usage.
-
-### Health endpoint (detailed)
-
-The health API reports status per dependency (database, Redis, optional external) without exposing internal details.
-
-- **Readiness** (`GET /api/health` or `GET /api/health/ready`): Returns `200` when all _configured_ critical dependencies (DB, Redis) are up; returns `503` if any critical dependency is down. When `DATABASE_URL` or `REDIS_URL` are not set, those dependencies are reported as `not_configured` and do not cause `503`.
-- **Liveness** (`GET /api/health/live`): Returns `200` when the process is running (no dependency checks). Use for Kubernetes/orchestrator liveness probes.
-
-Response shape (readiness):
-
-```json
-{
-  "status": "ok",
-  "service": "credence-backend",
-  "dependencies": {
-    "db": { "status": "up" },
-    "redis": { "status": "up" }
-  }
-}
-```
-
-`status` may be `ok`, `degraded` (optional external down), or `unhealthy` (critical dependency down). Each dependency `status` is `up`, `down`, or `not_configured`. Optional env: `DATABASE_URL`, `REDIS_URL` to enable DB and Redis checks.
-
-#### Testing
-
-Health endpoints are covered by unit and route tests. Run:
-
-```bash
-npm test
-npm run test:coverage
-```
-
-Scenarios covered: all dependencies up, DB down (503), Redis down (503), both down (503), only external down (200 degraded), liveness always 200, and no dependencies configured (200 ok).
-
-### Identity state sync
-
-The **identity state sync** listener keeps database identity and bond state in sync with on-chain state (reconciliation or full refresh). Use it to correct drift from missed events or for recovery.
-
-- **Location:** `src/listeners/identityStateSync.ts`
-- **Reconciliation by address:** `sync.reconcileByAddress(address)` – fetches current state from the contract, diffs with DB, and updates the store if there is drift.
-- **Full resync:** `sync.fullResync()` – reconciles all known identities (union of store and contract addresses). Use for recovery or bootstrap.
-
-You supply:
-
-- **ContractReader** – Fetches current bond/identity state from chain (e.g. Horizon or contract reads). Implement `getIdentityState(address)` and optionally `getAllIdentityAddresses()`.
-- **IdentityStateStore** – Your persistence layer (e.g. DB). Implement `get`, `set`, and `getAllAddresses`.
-
-State shape is `IdentityState`: `address`, `bondedAmount`, `bondStart`, `bondDuration`, `active`. See `src/listeners/types.ts`.
-
-Tests cover: no drift (no update), single drift (one address corrected), full resync (multiple drifts), chain missing, store-only addresses, and error handling.
-
-
-## Logging
-
-We rely on structured logging to maintain a consistent schema and protect PII. See **[docs/LOGGING.md](docs/LOGGING.md)** for our policy on reserved keys (`request_id`, `tenant`, `actor`) and redaction rules.
-
-## Monitoring
-
-Comprehensive monitoring with Prometheus and Grafana is available.
-
-- **[docs/METRICS_DASHBOARDS.md](docs/METRICS_DASHBOARDS.md)** — operator's reference mapping the Grafana dashboard panels directly to Service Level Indicators (SLIs) and Objectives (SLOs).
-- **[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)** — operator's index of every Prometheus metric, the Grafana dashboard panel for each, the PromQL behind every alert, and runnable triage queries. **Start here if you are operating the service.**
-- **[docs/monitoring.md](docs/monitoring.md)** — full setup, instrumentation, and deployment guide for Prometheus + Grafana.
-- **[docs/SLA.md](docs/SLA.md)** — uptime commitments and per-endpoint SLO/SLI targets for downstream integrators.
-
-- Metrics instrumentation guide
-- Grafana dashboard setup
-- Prometheus configuration
-- Alert rules
-- Queue monitoring on-call guide: **[docs/QUEUE_MONITORING.md](docs/QUEUE_MONITORING.md)**
-- Deployment instructions
-
-Alert routing — how a fired metric becomes a PagerDuty page or Slack message — is documented in **[docs/alert-routing-pipeline.md](docs/alert-routing-pipeline.md)** (contributor guide) and **[docs/alert-routing.md](docs/alert-routing.md)** (on-call reference).
-
-Quick start:
-
-```bash
-# Install metrics dependency
-npm install prom-client
-
-# Start monitoring stack
-docker-compose up -d
-
-# Access services
-# - Prometheus: http://localhost:9090
-# - Grafana: http://localhost:3001 (admin/admin)
-# - Metrics endpoint: http://localhost:3000/metrics
-```
-
-The Grafana dashboard includes:
-
-- HTTP metrics (request rate, latency, error rate, status codes)
-- Infrastructure health (DB, Redis status and check duration)
-- Business metrics (reputation calculations, identity verifications, bulk operations)
-
-## Deployment: Cutover, Health Gates & Rollback
-
-The service deploys to Kubernetes as a zero-downtime rolling update (`k8s/deployment.yaml`). See:
-
-- **[docs/DEPLOY.md](docs/DEPLOY.md)** — environment-specific (development, staging, production) deployment guide, prerequisites, and verification steps.
-- **[docs/k8s.md](docs/k8s.md)** — manifests, ConfigMap/Secret keys, and the first-time `kubectl apply -k k8s/` quick start.
-- **[docs/deployment-cutover.md](docs/deployment-cutover.md)** — the cutover sequence, exactly what the readiness/liveness/startup probes check (and their timing), and how to detect a bad rollout and trigger `kubectl rollout undo`.
-
-## Backup Strategy (WAL + PITR)
-
-Historical performance benchmarks, latency distributions, and throughput figures across major releases are documented in **[docs/PERF_BASELINE.md](docs/PERF_BASELINE.md)**. Use this document to eyeball performance regressions during pre-release testing.
-
-
-## Resilience: Timeouts & Retries
-
-The backend implements a comprehensive timeout and retry strategy for all external service dependencies. Webhook deliveries are now idempotent by default: duplicate retries for the same subscriber/event pair are ignored automatically using a persistent reservation keyed by the subscriber ID and event ID. See **[docs/timeouts-and-retries.md](docs/timeouts-and-retries.md)** for:
-
-- Global request budgets and timeout budgets by service type (database, cache, HTTP, Soroban, webhooks)
-- Default and per-provider retry policies
-- Downstream error classification (`NETWORK_ERROR` vs `TIMEOUT_ERROR` vs `RPC_ERROR`) with typed surfacing
-- Environment variable tuning guide
-- Operational runbook (symptom → diagnosis → tuning)
-
-For diagnosing a backed-up outbox event queue specifically, see **[docs/RUNBOOK_QUEUE_LAG.md](docs/RUNBOOK_QUEUE_LAG.md)**.
-For crash recovery across background workers, leases, retries, and shutdown, see
-**[docs/BACKGROUND_JOB_RECOVERY.md](docs/BACKGROUND_JOB_RECOVERY.md)**.
-
-## Horizon Listener
-
-The service includes a Horizon withdrawal events listener that:
-
-- **Monitors Stellar blockchain** for withdrawal transactions affecting bonds
-- **Updates bond states** (amount, active status) based on on-chain events
-- **Creates score history snapshots** for significant withdrawals
-- **Maintains consistency** between on-chain and database states
-- **Handles errors gracefully** with automatic retry and recovery
-
-See [docs/horizon-listener.md](./docs/horizon-listener.md) for detailed documentation.
-
-Every committed Horizon transition also writes a versioned, correlation-identified record to the `horizon_events` ledger inside the same transaction as the state mutation, and a deterministic parity verifier reconciles event payloads against final state. See [docs/horizon-events-parity.md](./docs/horizon-events-parity.md) for the design, invariants, failure behavior, and compatibility notes.
-
-## Caching
-
-The service includes a Redis-based caching layer with:
-
-- **Connection management** - Singleton Redis client with health monitoring
-- **Namespacing** - Automatic key namespacing (e.g., `trust:score:0x123`)
-- **TTL support** - Set expiration times on cached values
-- **Health checks** - Built-in Redis health monitoring
-- **Graceful fallback** - Continues working when Redis is unavailable
-- **Cache response header** - Appends `x-cache` header (`HIT`, `MISS`, or `STALE`) to responses for transparency
-
-See [docs/caching.md](./docs/caching.md) for detailed documentation, and
-[docs/CACHE_INVENTORY.md](./docs/CACHE_INVENTORY.md) for the full list of
-cache namespaces and their TTLs. For the mutation-to-invalidation map, see
-[docs/CACHE_INVALIDATION_TRIGGERS.md](./docs/CACHE_INVALIDATION_TRIGGERS.md).
-
-## API Clients & SDKs
-
-A TypeScript/JavaScript SDK is available at `src/sdk/` for programmatic access to the API. See [docs/sdk.md](docs/sdk.md) for full documentation.
-
-For a complete list of recommended client libraries and guidance on generating clients for other languages, see **docs/API_CLIENTS.md**.
-
-## Configuration
-
-The config module (`src/config/index.ts`) centralizes all environment handling:
-
-- Loads `.env` files via [dotenv](https://github.com/motdotla/dotenv) for local development
-- Validates **all** environment variables at startup using [Zod](https://zod.dev)
-- Fails fast with a clear error message listing every invalid or missing variable
-- Exports a fully typed `Config` object consumed by the rest of the application
-
-### Usage
-
-```ts
-import { loadConfig } from "./config/index.js";
-
-const config = loadConfig();
-console.log(config.port); // number
-console.log(config.db.url); // string
-console.log(config.features); // { trustScoring: boolean, bondEvents: boolean }
-```
-
-For testing, use `validateConfig()` which throws a `ConfigValidationError` instead of calling `process.exit`:
-
-```ts
-import { validateConfig, ConfigValidationError } from "./config/index.js";
-
-try {
-  const config = validateConfig({ DB_URL: "bad" });
-} catch (err) {
-  if (err instanceof ConfigValidationError) {
-    console.error(err.issues); // Zod issues array
-  }
-}
-```
-
-## Environment Variables
-
-| Variable                      | Required | Default       | Description                                            |
-| ----------------------------- | -------- | ------------- | ------------------------------------------------------ |
-| `PORT`                        | No       | `3000`        | Server port (1–65535)                                  |
-| `NODE_ENV`                    | No       | `development` | `development`, `production`, or `test`                 |
-| `LOG_LEVEL`                   | No       | `info`        | `debug`, `info`, `warn`, or `error`                    |
-| `DB_URL`                      | **Yes**  | —             | PostgreSQL connection URL                              |
-| `REDIS_URL`                   | **Yes**  | —             | Redis connection URL                                   |
-| `JWT_SECRET`                  | **Yes**  | —             | JWT signing secret (≥ 32 chars)                        |
-| `JWT_EXPIRY`                  | No       | `1h`          | JWT token lifetime                                     |
-| `ENABLE_TRUST_SCORING`        | No       | `false`       | Enable trust scoring feature                           |
-| `ENABLE_BOND_EVENTS`          | No       | `false`       | Enable bond event processing                           |
-| `HORIZON_URL`                 | No       | —             | Stellar Horizon API URL                                |
-| `CORS_ORIGIN`                 | No       | `*`           | Allowed CORS origin                                    |
-| `ANALYTICS_REFRESH_CRON`      | No       | `*/5 * * * *` | Refresh cadence for analytics materialized view        |
-| `ANALYTICS_STALENESS_SECONDS` | No       | `300`         | Max acceptable analytics staleness before marked stale |
-| `DB_POOL_IDLE_TIMEOUT_MS`     | No       | `300000`      | Milliseconds a pooled connection may stay idle before being closed. Kills idle connections to keep pool counts predictable. |
-| `DB_POOL_MAX`                 | No       | `20`          | Maximum connections in the primary pool                |
-| `DB_WORKER_POOL_MAX`          | No       | `5`           | Maximum connections in the background-worker pool      |
-| `DB_REPLICA_POOL_MAX`         | No       | `DB_POOL_MAX` | Maximum connections in the read-replica pool; falls back to `DB_POOL_MAX` when unset |
-| `MAX_REPLICA_LAG_MS`          | No       | `1000`        | Max replication lag (ms) before reads fall back to the primary pool |
-| `DB_POOL_CONNECTION_TIMEOUT_MS` | No     | `5000`        | Milliseconds to wait for an available connection       |
-| `DB_STATEMENT_TIMEOUT_MS`     | No       | `30000`       | Per-statement timeout; kills runaway queries           |
-
-## Analytics materialized views
-
-Analytics endpoints are backed by PostgreSQL materialized views to reduce response latency on aggregate queries.
-
-- **View source:** `analytics_metrics_mv`
-- **Refresh mode:** `REFRESH MATERIALIZED VIEW CONCURRENTLY`
-- **Default cadence:** every 5 minutes (`ANALYTICS_REFRESH_CRON`)
-- **Freshness window:** 300 seconds (`ANALYTICS_STALENESS_SECONDS`)
-
-The endpoint response includes staleness metadata:
-
-- `asOf`: timestamp of snapshot used in the response
-- `ageSeconds`: age of snapshot when served
-- `fresh`: whether snapshot age is within tolerated window
-- `refreshStatus`: `ok`, `stale`, or `failed_recently`
-
-When a refresh fails, the API keeps serving the last successful snapshot and marks the response with degraded freshness metadata.
 
 ## Database Migrations
 
-The project uses [node-pg-migrate](https://salsita.github.io/node-pg-migrate/) for PostgreSQL database migrations with versioning and rollback support.
-
-### Prerequisites
-
-- PostgreSQL database
-- `DATABASE_URL` environment variable set (e.g., `postgres://user:password@localhost:5432/credence`)
-
-### Quick Start
-
-**Development (recommended):**
+Database migrations are powered by [node-pg-migrate](https://salsita.github.io/node-pg-migrate/) with SHA-256 checksum validation to prevent schema drift.
 
 ```bash
-# Build TypeScript and run all pending migrations
-npm run migrate:dev
-```
-
-**Production/CI:**
-
-```bash
-# Requires dist/ to be built first
-npm run build
-npm run migrate
-```
-
-### Creating Migrations
-
-Create a new TypeScript migration file:
-
-```bash
-npm run migrate:create my_migration_name
-```
-
-This creates a timestamped `.ts` file in `src/migrations/`.
-
-### Migration Workflow
-
-**Development:**
-
-```bash
-# Build and run all pending migrations
+# Apply pending migrations locally
 npm run migrate:dev
 
-# Check which migrations would run (dry run)
-npm run migrate:dev -- --dry-run
-# Preview pending SQL statements via Admin API
-curl -X GET http://localhost:3000/api/admin/migrations/dry-run -H "Authorization: Bearer <ADMIN_API_KEY>"
-```
+# Create a new migration file
+npm run migrate:create my_new_migration
 
-
-**Production/CI (requires build first):**
-
-```bash
-npm run build
-npm run migrate
+# Rollback previous migration
 npm run migrate:down
+
+# Preview migration execution (dry run)
+npm run migrate:dry-run
+
+# Reset local test database
+npm run test:db:reset
 ```
 
-**Rollback:**
+---
+
+## API Overview
+
+| Method | Endpoint | Description | Auth / Scope |
+|---|---|---|---|
+| `GET` | `/api/health` | Comprehensive readiness probe (DB, Redis, dependencies) | Public |
+| `GET` | `/api/health/live` | Process liveness probe | Public |
+| `GET` | `/api/version` | Service build information, git commit SHA, and node version | Public |
+| `GET` | `/.well-known/jwks.json` | Public JSON Web Key Set for token verification | Public |
+| `GET` | `/api/trust/:address` | Retrieve trust score for a Stellar address | Public |
+| `GET` | `/api/bond/:address` | Retrieve on-chain bond status and parameters | Public |
+| `GET` | `/api/attestations/:address`| List active attestations for address | Public |
+| `POST`| `/api/attestations` | Create a new attestation record | Authenticated |
+| `POST`| `/api/payouts` | Submit settlement payout (idempotent with `Idempotency-Key`) | `payouts:write` |
+| `GET` | `/api/analytics/summary` | Aggregated analytics summary from materialized views | Authenticated |
+| `GET` | `/api/reports/top-talkers` | Top tenant request volume in the trailing hour | Admin |
+| `GET` | `/metrics` | Prometheus metrics scrape endpoint | Restricted |
+
+Detailed API specifications, sample payloads, and cURL examples can be found in **[docs/api.md](docs/api.md)** and the OpenAPI specification at **`docs/openapi.yaml`**.
+
+---
+
+## Testing & Quality Assurance
+
+Run the test suite via [Vitest](https://vitest.dev/):
 
 ```bash
-# Development (builds first)
-npm run migrate:dev -- migrate:down
+# Run unit & integration tests
+npm test
 
-# Production (requires dist/ built)
-npm run migrate:down
+# Run tests with coverage report
+npm run test:coverage
+
+# Run chaos tests (fault injection)
+npm run test:chaos
+
+# Run code linter
+npm run lint
+
+# Auto-fix linting violations
+npm run lint:fix
 ```
 
-### Migration File Structure
+Detailed testing instructions and guides are available in **[docs/CONTRIBUTING-TESTING.md](docs/CONTRIBUTING-TESTING.md)**.
 
-```typescript
-import { MigrationBuilder } from "node-pg-migrate";
+---
 
-export async function up(pgm: MigrationBuilder): Promise<void> {
-  // Apply changes (create tables, add columns, etc.)
-  pgm.createTable("users", {
-    id: "id",
-    email: { type: "varchar(255)", notNull: true },
-  });
-}
+## Observability & Operations
 
-export async function down(pgm: MigrationBuilder): Promise<void> {
-  // Reverse changes
-  pgm.dropTable("users");
-}
-```
+- **Prometheus Metrics**: Scraped via `/metrics`. Metric documentation in **[docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)**.
+- **Grafana Dashboards**: Dashboards mapped directly to SLOs/SLIs. Guide in **[docs/METRICS_DASHBOARDS.md](docs/METRICS_DASHBOARDS.md)**.
+- **Alert Routing**: Pipeline setup in **[docs/alert-routing.md](docs/alert-routing.md)**.
+- **Graceful Shutdown**: Ordered drain of HTTP, WebSocket, background schedulers, and connection pools. Reference in **[docs/graceful-shutdown.md](docs/graceful-shutdown.md)**.
+- **Read-Only Degradation**: Pass header `X-Read-Only: true` during maintenance. Details in **[docs/graceful-degrade.md](docs/graceful-degrade.md)**.
 
-### Environment Variables
+---
 
-| Variable                       | Description                                      | Default        |
-| ------------------------------ | ------------------------------------------------ | -------------- |
-| `DATABASE_URL`                 | PostgreSQL connection string                     | Required       |
-| `MIGRATIONS_TABLE`             | Table name for tracking migrations               | `pgmigrations` |
-| `MIGRATIONS_SCHEMA`            | Schema for migrations table                      | `public`       |
-| `MIGRATION_CHECKSUM_VALIDATE`  | Reject startup when applied migrations drift       | enabled        |
-| `MIGRATION_CHECKSUM_BOOTSTRAP` | Seed missing checksum records on first startup   | enabled        |
+## License
 
-### CI/CD Integration
-
-Run migrations in CI/CD pipelines (requires build first):
-
-```bash
-# Dockerfile or CI script
-npm ci
-npm run build
-DATABASE_URL=postgres://... npm run migrate
-npm start
-```
-
-### Initial Schema
-
-The first migration (`src/migrations/001_initial_schema.ts`) creates:
-
-- `identities` - Identity and bond state
-- `attestations` - Attestation records
-- `reputation_scores` - Cached reputation scores
-
-After running `npm run build`, migrations are executed from `dist/migrations/`.
-
-### Best Practices
-
-1. **Always test both `up()` and `down()`** before committing
-2. **Keep migrations idempotent** - safe to run multiple times
-3. **Use transactions** - enabled by default for atomicity
-4. **Don't modify existing migrations** after they've been applied
-5. **Create new migrations** for schema changes
-6. **Back up production database** before running migrations
-
-For large data migrations or backfills, you can track their execution in real-time. See **[docs/backfill-progress.md](docs/backfill-progress.md)**.
-
-## Tech
-
-- Node.js
-- TypeScript
-- Express
-- PostgreSQL (with migrations via node-pg-migrate)
-- Prometheus (metrics)
-- Grafana (visualization)
-- Redis (caching layer)
-- @stellar/stellar-sdk (Stellar blockchain integration)
-- Vitest (testing)
-- Zod (env validation)
-- dotenv (.env file support)
-
-Extend with additional Horizon event ingestion when implementing the full architecture.
-
-## Stellar/Soroban Integration
-
-- Adapter implementation: `src/clients/soroban.ts`
-- Integration notes: `docs/stellar-integration.md`
-- Tests: `src/clients/soroban.test.ts`
-
-## Graceful Shutdown
-
-On `SIGTERM` or `SIGINT`, the Credence Backend API executes an ordered graceful shutdown sequence:
-1. Stops accepting new HTTP connections and allows in-flight requests to drain (`server.close()`).
-2. Closes WebSocket subscription server connections gracefully.
-3. Stops event consumers and background schedulers.
-4. Closes database connection pools (primary, worker, replica) cleanly (`pool.end()`).
-5. Disconnects from Redis connection.
-
-The grace period is configurable via `SHUTDOWN_GRACE_PERIOD_MS` (default: 30,000 ms). For more details, see **[docs/graceful-shutdown.md](docs/graceful-shutdown.md)**.
-
-## Graceful Degradation
-
-During maintenance or database upgrades, operators can gracefully degrade the service to a read-only state. This is done on a per-request basis by passing the `X-Read-Only` header set to `true` or `1`.
-
-When active, any state-mutating requests (`POST`, `PUT`, `PATCH`, `DELETE`) are cleanly rejected with a `503 Service Unavailable` response, while read-only requests (`GET`, `HEAD`, `OPTIONS`) are permitted to proceed.
-
-For more details, see **[docs/graceful-degrade.md](docs/graceful-degrade.md)**.
-
-## Replay-Safe Handlers & Side-Effects
-
-To prevent duplicate side-effects (e.g., duplicate webhooks or notifications) when failed inbound events are replayed or retried, the system implements a context-aware replay-safe handler wrapper and a side-effect execution helper.
-
-For details on configuration and usage, see **[docs/REPLAY_SAFE_HANDLERS.md](docs/REPLAY_SAFE_HANDLERS.md)**.
-- [Replay & Inspection Guide (Operator)](docs/replay_and_inspection.md)
-- [Event Ordering Guarantees](docs/EVENT_ORDERING.md)
-
-
-## Observability & Logging
-
-For observability, request tracing, metrics, and structured logging guidelines:
-- **Structured Logging Policy**: See [docs/LOGGING.md](docs/LOGGING.md) for logs, formats, and conventions.
-- **Log Retention**: See [docs/LOG_RETENTION.md](docs/LOG_RETENTION.md) for how long each log type is kept and where.
-- **Request Tracing & Metrics**: See [docs/observability.md](docs/observability.md) for request tracing, PII redaction rules, and the `req.log` request-scoped logger.
-- **Correlation ID Middleware**: See `src/middleware/correlationId.ts` — every request receives an `X-Correlation-ID` (propagated or auto-generated) for distributed tracing across services.
-
-## Security
-
-For security policies, reporting, and architecture documentation:
-- **Security Policy & Vulnerability Reporting**: See [SECURITY.md](SECURITY.md) for details on supported versions and how to report a vulnerability.
-- **Dependency Upgrades**: See [docs/dependency-upgrades.md](docs/dependency-upgrades.md) for how aggressively we upgrade deps and our review process.
-- **Security Architecture**: See [docs/security.md](docs/security.md) for details on the API key scope model, encrypted evidence storage, rate limiting, and dependency scanning SLAs.
-- **API Key Scopes**: See [docs/SCOPES.md](docs/SCOPES.md) for every available scope, which endpoints each unlocks, and how to request the right set for your integration.
-- **Canonical JWT Claims Reference**: See [docs/JWT_CLAIMS.md](docs/JWT_CLAIMS.md) for standard, custom, and impersonation JWT claims, headers, and consumer middleware.
-- **Rate Limiting Support & Operations**: See [docs/rate-limiting.md](docs/rate-limiting.md) for details on default tier rate limits, environment configuration, troubleshooting, and support FAQs.
-- **Rate Limit Response Headers**: See [docs/RATE_LIMIT_HEADERS.md](docs/RATE_LIMIT_HEADERS.md) for header semantics (`X-RateLimit-*`, `Retry-After`), calculation rules, and client integration examples.
-- **Evidence Upload Security**: See [docs/evidence-upload-security.md](docs/evidence-upload-security.md) for file upload security configurations, size/count limits, and magic number validations.
-- **Secret-Rotation Posture**: See [docs/SECRETS.md](docs/SECRETS.md) for where secrets live, rotation cadence, and blast radius of each credential type.
-- **Incoming Webhook Security & Posture**: See [docs/WEBHOOK_RECEIVE.md](docs/WEBHOOK_RECEIVE.md) for signature verification, 5-minute replay window tolerance, and CIDR allowed origins.
-
-## Testing
-
-For a full walkthrough — prerequisites, pg-mem vs testcontainers, running migrations, all test commands, the chaos suite, and troubleshooting — see **[docs/CONTRIBUTING-TESTING.md](docs/CONTRIBUTING-TESTING.md)**.
-
-Quick reference:
-
-```bash
-pnpm test                  # all tests (testcontainers auto-provisions Postgres)
-pnpm run test:coverage     # with coverage (40% global threshold)
-pnpm run coverage:audit    # audit-sensitive coverage (disputes, governance, evidence)
-pnpm run test:chaos        # chaos suite (requires docker-compose.test.yml up)
-```
-
-
-## Rate Limiting
-
-[#rate-limiting](#rate-limiting)
-
-API requests are limited per-tier using a token-bucket algorithm. See
-**[docs/RATE_LIMITING_DESIGN.md](./docs/RATE_LIMITING_DESIGN.md)** for
-tier sizes, burst allowance, and reset windows.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.

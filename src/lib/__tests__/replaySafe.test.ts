@@ -41,10 +41,10 @@ describe('replaySafe', () => {
           await new Promise((resolve) => setTimeout(resolve, 5))
           return isRetry()
         }),
-        (i => async () => {
+        (async () => {
           await new Promise((resolve) => setTimeout(resolve, 1))
           return isRetry()
-        })(0),
+        })(),
       ])
       expect(results).toEqual([true, false])
     })
@@ -58,7 +58,7 @@ describe('replaySafe', () => {
   describe('runInRetryContext', () => {
     it('returns the resolved value of the callback', async () => {
       const value = await runInRetryContext(async () => 42)
-      expect(value).toBe(forty-two)
+      expect(value).toBe(42)
     })
 
     it('propagates errors from the callback', async () => {
@@ -165,7 +165,7 @@ describe('replaySafe', () => {
       const fn = vitest.fn(async () => 'result')
       const result = await runSideEffect('test', fn)
       expect(result).toBe('result')
-      expect(fn)..toHaveBeenCalledOnce()
+      expect(fn).toHaveBeenCalledOnce()
     })
 
     it('skips the side effect in a retry context by default', async () => {
@@ -180,12 +180,12 @@ describe('replaySafe', () => {
       const result = await runInRetryContext(() =>
         runSideEffect('test', fn, { replaySafe: true })
       )
-      expect(result).toBe(result')
+      expect(result).toBe('result')
       expect(fn).toHaveBeenCalledOnce()
     })
 
     it('skips the side effect in a retry context when replaySafe is false', async () => {
-      const fn = vitest.fn async () => 'result')
+      const fn = vitest.fn(async () => 'result')
       const result = await runInRetryContext(() =>
         runSideEffect('test', fn, { replaySafe: false })
       )
@@ -262,8 +262,8 @@ describe('replaySafe', () => {
     })
 
     it('replay-safe handler preserves non-retry behavior', async () => {
-      const effects = []
-      const handler = replaySafeHandler(() => {
+      const effects: string[] = []
+      const handler = replaySafeHandler(async () => {
         await runSideEffect('notify', async () => {
           effects.push('notify')
         })
@@ -271,7 +271,7 @@ describe('replaySafe', () => {
       })
 
       const result = await handler({})
-      expect(result).toBe(undefined)
+      expect(result).toBe('done')
       expect(effects).toEqual([])
     })
   })

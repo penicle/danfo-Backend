@@ -1,0 +1,255 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { JobScheduler, parseCronToInterval, createScheduler } from './scheduler.js'
+import type { ScoreSnapshotJob } from './scoreSnapshot.js'
+
+describe('parseCronToInterval', () => {
+  it('parses every minute cron', () => {
+    expect(parseCronToInterval('* * * * *')).toBe(60000)
+  })
+
+  it('parses every hour cron', () => {
+    expect(parseCronToInterval('0 * * * *')).toBe(3600000)
+  })
+
+  it('parses every day cron', () => {
+    expect(parseCronToInterval('0 0 * * *')).toBe(86400000)
+  })
+
+  it('throws on invalid cron expression', () => {
+    expect(() => parseCronToInterval('invalid')).toThrow('Invalid cron expression')
+  })
+
+  it('throws on unsupported cron pattern', () => {
+    expect(() => parseCronToInterval('15 * * * *')).toThrow('Unsupported cron expression')
+  })
+})
+
+describe('JobScheduler', () => {
+  let mockJob: ScoreSnapshotJob
+  let scheduler: JobScheduler
+
+  beforeEach(() => {
+    mockJob = {
+      run: vi.fn().mockResolvedValue({
+        processed: 10,
+        saved: 10,
+        errors: 0,
+        duration: 100,
+        startTime: new Date().toISOString(),
+      }),
+    } as unknown as ScoreSnapshotJob
+  })
+
+  afterEach(() => {
+    if (scheduler) {
+      scheduler.stop()
+    }
+    vi.restoreAllMocks()
+  })
+
+  it('starts scheduler with interval', () => {
+    scheduler = new JobScheduler(mockJob, { intervalMs: 60000 })
+    scheduler.start()
+
+    expect(scheduler.isActive()).toBe(true)
+  })
+
+  it('stops scheduler', () => {
+    scheduler = new JobScheduler(mockJob, { intervalMs: 60000 })
+    scheduler.start()
+    scheduler.stop()
+
+    expect(scheduler.isActive()).toBe(false)
+  })
+
+  it('runs job at intervals', async () => {
+    vi.useFakeTimers()
+    scheduler = new JobScheduler(mockJob, { intervalMs: 60000 })
+    scheduler.start()
+
+    await vi.advanceTimersByTimeAsync(60000)
+    expect(mockJob.run).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(60000)
+    expect(mockJob.run).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
+  })
+
+  it('runs job immediately when runOnStart is true', async () => {
+    scheduler = new JobScheduler(mockJob, { intervalMs: 60000, runOnStart: true })
+    scheduler.start()
+
+    // Wait for the job to complete
+    await new Promise(resolve => setImmediate(resolve))
+
+    expect(mockJob.run).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not run immediately when runOnStart is false', () => {
+    scheduler = new JobScheduler(mockJob, { intervalMs: 60000, runOnStart: false })
+    scheduler.start()
+
+    expect(mockJob.run).not.toHaveBeenCalled()
+  })
+
+  it('skips interval if job is still running', async () => {
+    let resolveJob: () => void
+    const jobPromise = new Promise<any>(resolve => {
+      resolveJob = () => resolve({
+        processed: 10,
+        saved: 10,
+        errors: 0,
+        duration: 100,
+        startTime: new Date().toISOString(),
+      })
+    })
+
+    mockJob.run = vi.fn().mockReturnValue(jobPromise)
+
+    scheduler = new JobScheduler(mockJob, { intervalMs: 100, runOnStart: true })
+    scheduler.start()
+
+    await new Promise(resolve => setImmediate(resolve))
+
+    // Wait for interval
+    await new Promise(resolve => setTimeout(resolve, 120))
+
+    // Job should only be called once (still running)
+    const firstCallCount = (mockJob.run as any).mock.calls.length
+    expect(firstCallCount).toBe(1)
+
+    // Resolve the job
+    resolveJob!()
+    await new Promise(resolve => setImmediate(resolve))
+
+    // Wait for next interval
+    await new Promise(resolve => setTimeout(resolve, 120))
+
+    // Job should be called again (at least 2 times total)
+    expect((mockJob.run as any).mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('handles job errors gracefully', async () => {
+    mockJob.run = vi.fn().mockRejectedValue(new Error('Job failed'))
+
+    const logs: string[] = []
+    scheduler = new JobScheduler(mockJob, {
+      intervalMs: 60000,
+      runOnStart: true,
+      logger: (msg) => logs.push(msg),
+    })
+    scheduler.start()
+
+    await new Promise(resolve => setImmediate(resolve))
+
+    expect(logs.some(log => log.includes('Job failed'))).toBe(true)
+    expect(scheduler.isActive()).toBe(true) // Scheduler should still be active
+  })
+
+  it('logs job completion without exposing job results', async () => {
+    const logs: string[] = []
+    scheduler = new JobScheduler(mockJob, {
+      intervalMs: 60000,
+      runOnStart: true,
+      logger: (msg) => logs.push(msg),
+    })
+    scheduler.start()
+
+    await new Promise(resolve => setImmediate(resolve))
+
+    expect(logs.some(log => log.includes('Job completed'))).toBe(true)
+    expect(logs.some(log => log.includes('processed'))).toBe(false)
+  })
+
+  it('does not start if already running', () => {
+    const logs: string[] = []
+    scheduler = new JobScheduler(mockJob, {
+      intervalMs: 60000,
+      logger: (msg) => logs.push(msg),
+    })
+    scheduler.start()
+    scheduler.start()
+
+    expect(logs.filter(log => log.includes('already running')).length).toBe(1)
+  })
+
+  it('creates scheduler with factory function', () => {
+    scheduler = createScheduler(mockJob, {
+      cronExpression: '0 * * * *',
+    })
+
+    expect(scheduler).toBeInstanceOf(JobScheduler)
+  })
+
+  it('uses default cron expression', () => {
+    scheduler = createScheduler(mockJob)
+    scheduler.start()
+
+    expect(scheduler.isActive()).toBe(true)
+  })
+
+  it('converts cron to interval correctly', () => {
+    scheduler = createScheduler(mockJob, {
+      cronExpression: '0 * * * *', // Every hour
+    })
+    scheduler.start()
+
+    expect(scheduler.isActive()).toBe(true)
+  })
+})
+
+describe('JobScheduler correlation id propagation', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('runs each job invocation inside its own correlation-id context', async () => {
+    const { getActiveCorrelationIds } = await import('../utils/logger.js')
+    const seenIds: (string | undefined)[] = []
+
+    const job: ScoreSnapshotJob = {
+      run: vi.fn(async () => {
+        seenIds.push(getActiveCorrelationIds().correlationId)
+        return { processed: 1, saved: 1, errors: 0, duration: 1, startTime: new Date().toISOString() }
+      }),
+    } as unknown as ScoreSnapshotJob
+
+    const scheduler = new JobScheduler(job, { intervalMs: 1_000_000, runOnStart: true })
+    scheduler.start()
+
+    // Allow the runOnStart invocation's async job.run() to complete.
+    await new Promise(resolve => setImmediate(resolve))
+    await new Promise(resolve => setImmediate(resolve))
+
+    scheduler.stop()
+
+    expect(seenIds).toHaveLength(1)
+    expect(seenIds[0]).toBeTruthy()
+    // A fresh uuid-shaped correlation id, since there is no originating request.
+    expect(seenIds[0]).toMatch(/^[0-9a-f-]{36}$/i)
+  })
+
+  it('gives sequential job runs different correlation ids', async () => {
+    const { getActiveCorrelationIds } = await import('../utils/logger.js')
+    const seenIds: (string | undefined)[] = []
+
+    const job: ScoreSnapshotJob = {
+      run: vi.fn(async () => {
+        seenIds.push(getActiveCorrelationIds().correlationId)
+        return {}
+      }),
+    } as unknown as ScoreSnapshotJob
+
+    const scheduler = new JobScheduler(job, { intervalMs: 1_000_000 })
+
+    // Invoke the private runJob twice directly (via start/stop cycles) to
+    // avoid depending on real timer intervals in this test.
+    await (scheduler as any).runJob()
+    await (scheduler as any).runJob()
+
+    expect(seenIds).toHaveLength(2)
+    expect(seenIds[0]).toBeTruthy()
+    expect(seenIds[1]).toBeTruthy()
+    expect(seenIds[0]).not.toBe(seenIds[1])
+  })
+})

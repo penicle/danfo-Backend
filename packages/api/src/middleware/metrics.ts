@@ -1,0 +1,552 @@
+/**
+ * Prometheus metrics middleware for Credence Backend
+ * 
+ * This is an example implementation. To use:
+ * 1. Install prom-client: npm install prom-client
+ * 2. Rename this file to metrics.ts
+ * 3. Import and use in src/index.ts
+ * 
+ * See docs/monitoring.md for complete setup instructions
+ */
+
+import { Request, Response, NextFunction } from 'express'
+import client from 'prom-client'
+import {
+  httpRequestDurationHistogram,
+  httpRequestStatusTotal,
+  normalizeRoute,
+  getRouteTemplate,
+  registerLatencyMetrics,
+} from '../observability/latencyMetrics.js'
+import {
+  registerPoolMetrics,
+  registerRpcLatencyMetrics,
+  registerPreparedStatementCacheMetrics,
+} from '../observability/index.js'
+import { registerAdvisoryLockMetrics } from '../jobs/advisoryLockMonitor.js'
+import {
+  pool,
+  workerPool,
+  apiPreparedStatementCache,
+  workerPreparedStatementCache,
+  replicaPreparedStatementCache,
+} from '../db/pool.js'
+
+// Create a Registry to register metrics
+export const register = new client.Registry()
+
+// Register latency percentile metrics
+registerLatencyMetrics(register)
+
+// Register database connection pool metrics
+registerPoolMetrics(register, pool, workerPool)
+
+// Register prepared-statement cache size metrics
+registerPreparedStatementCacheMetrics(register, {
+  api: apiPreparedStatementCache,
+  worker: workerPreparedStatementCache,
+  replica: replicaPreparedStatementCache,
+})
+
+// Register downstream RPC latency metrics
+registerRpcLatencyMetrics(register)
+
+// Register circuit breaker metrics
+import { registerCircuitBreakerMetrics } from '../clients/circuitBreaker.js'
+registerCircuitBreakerMetrics(register)
+
+// Add default Node.js metrics (CPU, memory, event loop, etc.)
+client.collectDefaultMetrics({ 
+  register,
+  prefix: 'nodejs_'
+})
+
+// ============================================================================
+// HTTP Metrics
+// ============================================================================
+
+export const httpRequestsTotal = new client.Counter({
+  name: 'http_requests_total',
+  help: 'Total number of HTTP requests',
+  labelNames: ['method', 'route', 'status'],
+  registers: [register]
+})
+
+export const responseSizeBytes = new client.Histogram({
+  name: 'http_response_size_bytes',
+  help: 'Size of HTTP responses in bytes',
+  labelNames: ['compressed'],
+  buckets: [1024, 5120, 10240, 51200, 102400, 512000, 1048576, 5242880], // From 1KB to 5MB
+  registers: [register]
+})
+
+// ============================================================================
+// Health Check Metrics
+// ============================================================================
+
+export const healthCheckStatus = new client.Gauge({
+  name: 'health_check_status',
+  help: 'Health check status (1 = up, 0 = down)',
+  labelNames: ['dependency'],
+  registers: [register]
+})
+
+export const healthCheckDuration = new client.Gauge({
+  name: 'health_check_duration_seconds',
+  help: 'Duration of health checks in seconds',
+  labelNames: ['dependency'],
+  registers: [register]
+})
+
+// ============================================================================
+// Business Metrics
+// ============================================================================
+
+export const reputationScoreCalculations = new client.Counter({
+  name: 'reputation_score_calculations_total',
+  help: 'Total number of reputation score calculations',
+  registers: [register]
+})
+
+export const reputationCalculationDuration = new client.Histogram({
+  name: 'reputation_calculation_duration_seconds',
+  help: 'Duration of reputation calculations in seconds',
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+  registers: [register]
+})
+
+export const identityVerifications = new client.Counter({
+  name: 'identity_verifications_total',
+  help: 'Total number of identity verifications',
+  labelNames: ['status'],
+  registers: [register]
+})
+
+export const bulkVerifications = new client.Counter({
+  name: 'bulk_verifications_total',
+  help: 'Total number of bulk verification requests',
+  labelNames: ['status'],
+  registers: [register]
+})
+
+export const bulkVerificationBatchSize = new client.Histogram({
+  name: 'bulk_verification_batch_size',
+  help: 'Size of bulk verification batches',
+  buckets: [1, 5, 10, 25, 50, 75, 100],
+  registers: [register]
+})
+
+export const bulkQueueWaitSeconds = new client.Histogram({
+  name: 'bulk_queue_wait_seconds',
+  help: 'Time jobs spend waiting in the bulk verification queue',
+  labelNames: ['org_id'],
+  buckets: [0.5, 1, 2, 5, 10, 30, 60, 300],
+  registers: [register]
+})
+
+export const identitySyncDuration = new client.Histogram({
+  name: 'identity_sync_duration_seconds',
+  help: 'Duration of identity state sync operations',
+  labelNames: ['operation'],
+  buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [register]
+})
+
+export const staleCacheReadsTotal = new client.Counter({
+  name: 'stale_cache_reads_total',
+  help: 'Total number of stale read detections after a transaction status update',
+  labelNames: ['namespace'],
+  registers: [register]
+})
+
+// ============================================================================
+// Idempotency Metrics
+// ============================================================================
+
+export const idempotencyGuardChecks = new client.Counter({
+  name: 'idempotency_guard_checks_total',
+  help: 'Total number of idempotency guard checks',
+  labelNames: ['handler_type', 'result'],
+  registers: [register]
+})
+
+export const idempotencyDuplicatesDetected = new client.Counter({
+  name: 'idempotency_duplicates_detected_total',
+  help: 'Total number of duplicate messages detected',
+  labelNames: ['handler_type'],
+  registers: [register]
+})
+
+// ============================================================================
+// Settlement Metrics
+// ============================================================================
+
+export const settlementDuplicatesDetected = new client.Counter({
+  name: 'settlement_duplicates_detected_total',
+  help: 'Total number of settlement duplicates detected and collapsed via transaction_hash idempotency',
+  registers: [register]
+})
+
+export const settlementDriftTotal = new client.Counter({
+  name: 'settlement_drift_total',
+  help: 'Total number of settlement reconciliation drifts detected',
+  labelNames: ['finding_type'],
+  registers: [register]
+})
+
+export const settlementUnmatchedCount = new client.Gauge({
+  name: 'settlement_unmatched_count',
+  help: 'Current number of unmatched settlement reconciliation findings from the latest run',
+  registers: [register],
+})
+
+export const shadowWriteMismatches = new client.Counter({
+  name: 'shadow_write_mismatches_total',
+  help: 'Total number of shadow write mode mismatches between old and new pipelines',
+  labelNames: ['mismatch_type'],
+  registers: [register]
+})
+
+// ============================================================================
+// Webhooks Metrics
+// ============================================================================
+
+export const webhookDlqSize = new client.Gauge({
+  name: 'webhook_dlq_size',
+  help: 'Number of messages in the webhook dead-letter queue',
+  registers: [register]
+})
+
+// ============================================================================
+// JWT Signing-Key Metrics
+// ============================================================================
+
+export const signingKeyRotationsTotal = new client.Counter({
+  name: 'signing_key_rotations_total',
+  help: 'Total number of JWT signing-key rotations',
+  labelNames: ['result'],
+  registers: [register],
+})
+
+export const signingKeyPrunesTotal = new client.Counter({
+  name: 'signing_key_prunes_total',
+  help: 'Total number of retired signing keys garbage-collected after the grace window',
+  registers: [register],
+})
+
+export const jwksRequestsTotal = new client.Counter({
+  name: 'jwks_requests_total',
+  help: 'Total number of /.well-known/jwks.json requests, partitioned by HTTP outcome',
+  labelNames: ['cache', 'status'],
+  registers: [register],
+})
+
+/**
+ * Record a JWT signing-key rotation (`success` or `error`).
+ *
+ * Called from both the admin rotate route and the background
+ * KeyRotationScheduler.
+ */
+export function recordSigningKeyRotation(result: 'success' | 'error'): void {
+  signingKeyRotationsTotal.inc({ result })
+}
+
+/**
+ * Record the number of retired keys pruned by the KeyManager at the end
+ * of a grace window.
+ */
+export function recordSigningKeyPrune(count: number): void {
+  if (count > 0) signingKeyPrunesTotal.inc(count)
+}
+
+/**
+ * Record a single /.well-known/jwks.json request.
+ * `cache` is `'hit'` (304 Not Modified served) or `'miss'` (full body served).
+ */
+export function recordJwksRequest(cache: 'hit' | 'miss', status: number): void {
+  jwksRequestsTotal.inc({ cache, status: String(status) })
+}
+
+// ============================================================================
+// Redis Cache Metrics
+// ============================================================================
+
+export const redisKeySizeBytes = new client.Histogram({
+  name: 'redis_key_size_bytes',
+  help: 'Size in bytes of values written to Redis cache keys, labeled by cache namespace. Helps detect a single endpoint ballooning a key (e.g. a hash/JSON blob) into a mega-key.',
+  labelNames: ['namespace'],
+  buckets: [1024, 4096, 16384, 65536, 262144, 1048576, 4194304], // 1KB to 4MB
+  registers: [register]
+})
+
+// ============================================================================
+// Memory/OOM Metrics
+// ============================================================================
+
+export const oomEventsTotal = new client.Counter({
+  name: 'oom_events_total',
+  help: 'Total number of out-of-memory events detected',
+  registers: [register]
+})
+
+// ============================================================================
+// Middleware
+// ============================================================================
+
+/**
+ * Express middleware to track HTTP request metrics
+ * 
+ * Usage:
+ * ```typescript
+ * import { metricsMiddleware } from './middleware/metrics.js'
+ * app.use(metricsMiddleware)
+ * ```
+ */
+export function metricsMiddleware(req: Request, res: Response, next: NextFunction) {
+  // Initialize a fresh metrics namespace for each request to avoid leakage
+  (req as any).metrics = {};
+  const hrStart = process.hrtime.bigint()
+  
+  res.on('finish', () => {
+    const durationSeconds = Number(process.hrtime.bigint() - hrStart) / 1e9
+    // Use getRouteTemplate which correctly joins req.baseUrl + req.route.path
+    // so sub-router mounted routes produce fully-qualified templates.
+    const route = getRouteTemplate(req)
+    const statusClass = `${Math.floor(res.statusCode / 100)}xx`
+    
+    httpRequestsTotal.inc({
+      method: req.method,
+      route,
+      status: res.statusCode
+    })
+    
+    httpRequestDurationHistogram.observe({
+      method: req.method,
+      route,
+      status_class: statusClass
+    }, durationSeconds)
+
+    httpRequestStatusTotal.inc({
+      method: req.method,
+      route,
+      status_class: statusClass
+    })
+  })
+  
+  next()
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Record health check result
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordHealthCheck } from './middleware/metrics.js'
+ * 
+ * const start = Date.now()
+ * const isUp = await checkDatabase()
+ * recordHealthCheck('db', isUp, Date.now() - start)
+ * ```
+ */
+export function recordHealthCheck(
+  dependency: string,
+  isUp: boolean,
+  durationMs: number
+) {
+  healthCheckStatus.set({ dependency }, isUp ? 1 : 0)
+  healthCheckDuration.set({ dependency }, durationMs / 1000)
+}
+
+/**
+ * Record reputation calculation
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordReputationCalculation } from './middleware/metrics.js'
+ * 
+ * const start = Date.now()
+ * const score = calculateReputationScore(input)
+ * recordReputationCalculation(Date.now() - start)
+ * ```
+ */
+export function recordReputationCalculation(durationMs: number) {
+  reputationScoreCalculations.inc()
+  reputationCalculationDuration.observe(durationMs / 1000)
+}
+
+/**
+ * Record identity verification
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordIdentityVerification } from './middleware/metrics.js'
+ * 
+ * try {
+ *   await verifyIdentity(address)
+ *   recordIdentityVerification('success')
+ * } catch (error) {
+ *   recordIdentityVerification('error')
+ * }
+ * ```
+ */
+export function recordIdentityVerification(status: 'success' | 'error') {
+  identityVerifications.inc({ status })
+}
+
+/**
+ * Record bulk verification
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordBulkVerification } from './middleware/metrics.js'
+ * 
+ * recordBulkVerification(addresses.length, 'success')
+ * ```
+ */
+export function recordBulkVerification(
+  batchSize: number,
+  status: 'success' | 'error'
+) {
+  bulkVerifications.inc({ status })
+  bulkVerificationBatchSize.observe(batchSize)
+}
+
+/**
+ * Record identity sync operation
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordIdentitySync } from './middleware/metrics.js'
+ * 
+ * const start = Date.now()
+ * await sync.reconcileByAddress(address)
+ * recordIdentitySync('reconcile', Date.now() - start)
+ * ```
+ */
+export function recordIdentitySync(
+  operation: 'reconcile' | 'full_resync',
+  durationMs: number
+) {
+  identitySyncDuration.observe({ operation }, durationMs / 1000)
+}
+
+/**
+ * Record stale cache read
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordStaleCacheRead } from './middleware/metrics.js'
+ * 
+ * recordStaleCacheRead('transaction_status')
+ * ```
+ */
+export function recordStaleCacheRead(namespace: string) {
+  staleCacheReadsTotal.inc({ namespace })
+}
+
+/**
+ * Record settlement duplicate detection via transaction_hash idempotency
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordSettlementDuplicate } from './middleware/metrics.js'
+ * 
+ * const result = await settlementService.upsertSettlementStatus(input)
+ * if (result.isDuplicate) {
+ *   recordSettlementDuplicate()
+ * }
+ * ```
+ */
+export function recordSettlementDuplicate() {
+  settlementDuplicatesDetected.inc()
+}
+
+export function recordIdempotencyCheck(handlerType: string, result: 'duplicate' | 'executed' | 'error'): void {
+  idempotencyGuardChecks.inc({ handler_type: handlerType, result })
+  if (result === 'duplicate') {
+    idempotencyDuplicatesDetected.inc({ handler_type: handlerType })
+  }
+}
+
+/**
+ * Record settlement reconciliation drift
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordSettlementDrift } from './middleware/metrics.js'
+ * 
+ * recordSettlementDrift('state_mismatch')
+ * ```
+ */
+export function recordSettlementDrift(findingType: 'state_mismatch' | 'missing_on_chain') {
+  settlementDriftTotal.inc({ finding_type: findingType })
+}
+
+/**
+ * Set the current unmatched settlement count gauge.
+ *
+ * Called at the end of each reconciliation run so operators can
+ * alert on non-zero drift without reading logs.
+ *
+ * @param count - Number of unmatched findings in the latest run
+ */
+export function setSettlementUnmatchedCount(count: number) {
+  settlementUnmatchedCount.set(count)
+}
+
+/**
+ * Record shadow write mode mismatch between old and new pipelines
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordShadowWriteMismatch } from './middleware/metrics.js'
+ * 
+ * if (oldResult.status !== newResult.status) {
+ *   recordShadowWriteMismatch('status_mismatch')
+ * }
+ * ```
+ */
+export function recordShadowWriteMismatch(
+  mismatchType: 'status_mismatch' | 'data_mismatch' | 'error_mismatch'
+) {
+  shadowWriteMismatches.inc({ mismatch_type: mismatchType })
+}
+
+/**
+ * Record webhook DLQ size
+ * 
+ * Usage:
+ * ```typescript
+ * import { recordWebhookDlqSize } from './middleware/metrics.js'
+ * 
+ * recordWebhookDlqSize(42)
+ * ```
+ */
+export function recordWebhookDlqSize(size: number) {
+  webhookDlqSize.set(size)
+}
+
+/**
+ * Record an out-of-memory event
+ */
+export function recordOomEvent(): void {
+  oomEventsTotal.inc()
+}
+
+/**
+ * Record the size (in bytes) of a value written to a Redis cache key.
+ *
+ * Usage:
+ * ```typescript
+ * import { recordRedisKeySize } from './middleware/metrics.js'
+ *
+ * recordRedisKeySize('attestation', Buffer.byteLength(serialized, 'utf8'))
+ * ```
+ */
+export function recordRedisKeySize(namespace: string, bytes: number): void {
+  redisKeySizeBytes.observe({ namespace }, bytes)
+}

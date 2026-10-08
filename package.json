@@ -1,11 +1,17 @@
 {
-  "name": "credence-backend",
+  "name": "danfo-backend",
   "version": "0.1.0",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "predev": "tsx scripts/check-pending-migrations.ts",
     "dev": "tsx watch src/index.ts",
+    "dev:api": "npm run --workspace=@danfo/api dev",
     "build": "tsc",
+    "build:core": "npm run --workspace=@danfo/core typecheck",
+    "build:api": "npm run --workspace=@danfo/api typecheck",
     "start": "node dist/index.js",
     "prepare": "husky install",
     "lint": "node --import tsx ./node_modules/eslint/bin/eslint.js src",

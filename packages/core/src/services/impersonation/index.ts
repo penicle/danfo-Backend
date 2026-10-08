@@ -1,0 +1,191 @@
+import { randomBytes } from 'crypto'
+import { userRepo } from '../../repositories/userRepository.js'
+import { AuditLogService, AuditAction, auditLogService } from '../audit/index.js'
+import { pool } from '../../db/pool.js'
+import { ImpersonationTokenRepository } from '../../repositories/impersonationTokenRepository.js'
+import type {
+  ImpersonationToken,
+  IssueImpersonationTokenRequest,
+  IssueImpersonationTokenResponse,
+} from './types.js'
+
+export type { ImpersonationToken, IssueImpersonationTokenRequest, IssueImpersonationTokenResponse }
+
+/** Default TTL: 15 minutes. Hard cap: 1 hour. */
+const DEFAULT_TTL_SECONDS = 900
+const MAX_TTL_SECONDS = 3600
+
+export class ImpersonationService {
+  private auditLog: AuditLogService
+  private repo: ImpersonationTokenRepository
+
+  constructor(auditLog: AuditLogService, repo: ImpersonationTokenRepository) {
+    this.auditLog = auditLog
+    this.repo = repo
+  }
+
+  /**
+   * Issue a short-lived impersonation token.
+   *
+   * Rules enforced:
+   * - Caller must be admin (enforced at route level via middleware).
+   * - Target user must exist.
+   * - Nested impersonation is forbidden (checked by the route handler).
+   * - `reason` is mandatory and non-empty.
+   * - TTL is capped at MAX_TTL_SECONDS.
+   */
+  async issueToken(
+    adminId: string,
+    adminEmail: string,
+    tenantId: string,
+    request: IssueImpersonationTokenRequest,
+    ipAddress?: string,
+    requestId?: string
+  ): Promise<IssueImpersonationTokenResponse> {
+    const { targetUserId, reason, ttlSeconds } = request
+
+    if (!reason || reason.trim().length === 0) {
+      await this.auditLog.logAction(
+        tenantId,
+        adminId,
+        adminEmail,
+        AuditAction.ISSUE_IMPERSONATION_TOKEN,
+        targetUserId,
+        undefined,
+        { reason },
+        'failure',
+        'reason is required',
+        ipAddress,
+        requestId
+      )
+      throw new Error('reason is required and must not be empty')
+    }
+
+    const target = userRepo.findById(targetUserId)
+    if (!target) {
+      await this.auditLog.logAction(
+        tenantId,
+        adminId,
+        adminEmail,
+        AuditAction.ISSUE_IMPERSONATION_TOKEN,
+        targetUserId,
+        undefined,
+        { reason },
+        'failure',
+        'target user not found',
+        ipAddress,
+        requestId
+      )
+      throw new Error(`User not found: ${targetUserId}`)
+    }
+
+    const ttl = Math.min(ttlSeconds ?? DEFAULT_TTL_SECONDS, MAX_TTL_SECONDS)
+    const now = new Date()
+    const expiresAt = new Date(now.getTime() + ttl * 1000)
+    const tokenId = randomBytes(32).toString('hex')
+
+    const record: ImpersonationToken = {
+      tokenId,
+      issuedBy: adminId,
+      issuedByEmail: adminEmail,
+      targetUserId,
+      targetUserEmail: target.email,
+      reason: reason.trim(),
+      issuedAt: now.toISOString(),
+      expiresAt: expiresAt.toISOString(),
+      revoked: false,
+    }
+
+    await this.repo.create(record)
+
+    await this.auditLog.logAction(
+      tenantId,
+      adminId,
+      adminEmail,
+      AuditAction.ISSUE_IMPERSONATION_TOKEN,
+      targetUserId,
+      target.email,
+      {
+        targetUserEmail: target.email,
+        tokenId,
+        reason: reason.trim(),
+        ttlSeconds: ttl,
+        expiresAt: expiresAt.toISOString(),
+      },
+      'success',
+      undefined,
+      ipAddress,
+      requestId
+    )
+
+    return { tokenId, targetUserId, targetUserEmail: target.email, expiresAt: expiresAt.toISOString(), ttlSeconds: ttl }
+  }
+
+  /**
+   * Revoke an impersonation token before it expires.
+   */
+  async revokeToken(
+    adminId: string,
+    adminEmail: string,
+    tenantId: string,
+    tokenId: string,
+    ipAddress?: string,
+    requestId?: string
+  ): Promise<void> {
+    const record = await this.repo.findById(tokenId)
+
+    if (!record) {
+      throw new Error(`Token not found: ${tokenId}`)
+    }
+
+    if (record.revoked) {
+      throw new Error(`Token already revoked: ${tokenId}`)
+    }
+
+    await this.repo.revoke(tokenId, adminId)
+
+    await this.auditLog.logAction(
+      tenantId,
+      adminId,
+      adminEmail,
+      AuditAction.REVOKE_IMPERSONATION_TOKEN,
+      record.targetUserId,
+      record.targetUserEmail,
+      {
+        targetUserEmail: record.targetUserEmail,
+        tokenId,
+        originalIssuedBy: record.issuedBy,
+      },
+      'success',
+      undefined,
+      ipAddress,
+      requestId
+    )
+  }
+
+  /**
+   * Validate a token and return the record it represents.
+   * Returns null if the token is missing, expired, or revoked.
+   */
+  /** Validates and returns the token if valid */
+  async validateToken(tokenId: string): Promise<ImpersonationToken | null> {
+    const record = await this.repo.findValid(tokenId)
+    return record
+  }
+
+  /** Run background sweep of expired tokens */
+  async cleanupExpiredTokens(): Promise<number> {
+    return await this.repo.deleteExpired()
+  }
+
+  /** For testing only — clears all stored tokens. */
+  async _reset(): Promise<void> {
+    await this.repo._reset()
+  }
+}
+
+/** Singleton instance shared across the app. */
+export const impersonationService = new ImpersonationService(
+  auditLogService,
+  new ImpersonationTokenRepository(pool)
+)
